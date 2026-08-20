@@ -1,21 +1,21 @@
-# 数据目录（体积大，不推 GitHub）
+# 数据/输出目录（大体积，不推 GitHub）
 saved_data/
 results/
 trajectory_data/
 CSV files/
 C-/
 D-/
-MAtt_baseline/
-pretest/
 figures/
-visualization/
+MAtt_baseline/results/
+pretest/output/
 
 # Python 缓存
 __pycache__/
 *.py[cod]
 
-# IDE / 编辑器
+# IDE / 系统文件
 .vscode/
+.DS_Store
 
 # 日志与临时文件
 *.log
