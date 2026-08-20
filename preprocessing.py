@@ -1,0 +1,413 @@
+
+import mne
+import numpy as np
+import scipy.stats
+
+# 平均参考处理
+def reference(raw):
+    raw_copy = raw.copy()
+    raw_copy.set_eeg_reference(ref_channels='average')
+    return raw_copy
+
+# 滤波处理
+def filter(raw) :
+    raw_copy = raw.copy()
+    raw_copy.filter(l_freq=8, h_freq=30, picks=['eeg'])
+    return raw_copy
+ 
+# 1. BCI IV-2a 完整的 22 个 EEG 通道 -> 标准 10-20 系统名称映射系
+def _normalize_ch_name(name):
+    """统一通道名格式，忽略大小写、点号、前后空格"""
+    return name.strip().upper().replace('.', '')
+
+
+def select_channels_physionetmi(raw):
+    """
+    PhysionetMI 数据集通道选择。
+    PhysionetMI 有 64 个 EEG 通道，我们选择与 BCI IV-2a 类似的中央区域通道，
+    并保留可用的 EOG 通道。
+    """
+    raw_copy = raw.copy()
+
+    # 选择与 BCI IV-2a 对应的 22 个 EEG 通道（从 PhysionetMI 的 64 个通道中）
+    eeg_channels = [
+        "Fz", "FC3", "FC1", "FCz", "FC2", "FC4", "C5", "C3", "C1", "Cz", "C2",
+        "C4", "C6", "CP3", "CP1", "CPz", "CP2", "CP4", "P1", "Pz", "P2", "POz",
+    ]
+
+    # 建立规范化后的通道名映射，兼容 'Fz', 'FZ', 'Fz.', 'fz.' 等写法
+    norm_to_orig = {_normalize_ch_name(ch): ch for ch in raw_copy.ch_names}
+
+    channels_to_keep = []
+    for ch in eeg_channels:
+        norm_ch = _normalize_ch_name(ch)
+        if norm_ch in norm_to_orig:
+            channels_to_keep.append(norm_to_orig[norm_ch])
+
+    if len(channels_to_keep) != len(eeg_channels):
+        missing = set(_normalize_ch_name(ch) for ch in eeg_channels) - set(norm_to_orig.keys())
+        raise ValueError(
+            f"PhysionetMI 22 通道选择失败，只找到 {len(channels_to_keep)}/22 个通道。"
+            f"缺失: {sorted(missing)}。原始通道名示例: {raw_copy.ch_names[:10]}"
+        )
+
+    # PhysionetMI 的 EOG 通道可能是 EOG1, EOG2, EOG3 或其他命名
+    eog_channels = [ch for ch in raw_copy.ch_names if 'EOG' in ch.upper()]
+    channels_to_keep.extend([ch for ch in eog_channels if ch in raw_copy.ch_names])
+
+    raw_copy.pick_channels(channels_to_keep)
+
+    # 设置 EOG 通道类型
+    eog_types = {ch: "eog" for ch in eog_channels if ch in raw_copy.ch_names}
+    if eog_types:
+        raw_copy.set_channel_types(eog_types)
+
+    # 设置电极坐标
+    raw_copy.set_montage("standard_1020", match_case=False, on_missing="warn")
+
+    # 断言：必须保留 22 个 EEG 通道
+    n_eeg = len(mne.pick_types(raw_copy.info, eeg=True, exclude=[]))
+    if n_eeg != len(eeg_channels):
+        raise ValueError(f"选择后 EEG 通道数为 {n_eeg}，期望 {len(eeg_channels)}")
+
+    return raw_copy
+
+
+def select_channels_auto(raw, preprocessor="physionetmi"):
+    """PhysionetMI 通道选择与预处理。"""
+    if preprocessor == "physionetmi":
+        return select_channels_physionetmi(raw)
+    raise ValueError(f"未支持的预处理管线: {preprocessor}")
+
+def ica_denoise(raw, threshold=2.5, max_exclude=2, adaptive_threshold=True):
+    """
+    改进的高效ICA去噪算法（无打印、无可视化版本）
+    
+    参数:
+        raw: MNE Raw，已选好 EEG+EOG 通道
+        threshold: 眼电检测阈值 (Z-score 阈值，通常 2.0~3.0)
+        max_exclude: 最多排除的ICA成分数
+        adaptive_threshold: 是否使用自适应阈值
+        
+    返回:
+        raw_clean: 去除伪迹后，且仅包含 EEG 通道的 Raw 数据
+        ica_metrics: 效果评估指标字典
+    """
+    raw_clean = raw.copy()
+    
+    picks_eeg = mne.pick_types(raw_clean.info, eeg=True, exclude=[])
+    picks_eog = mne.pick_types(raw_clean.info, eog=True, exclude=[])
+    
+    if len(picks_eeg) == 0:
+        return raw_clean, {}
+        
+    # 核心改进 1: 创建专用于拟合ICA的 1Hz 高通滤波数据（极大地提高ICA分离质量）
+    raw_for_ica = raw_clean.copy().filter(l_freq=1.0, h_freq=None, picks=picks_eeg, verbose=False)
+    
+    ica = mne.preprocessing.ICA(
+        n_components=min(40, len(picks_eeg)),
+        method='picard',
+        random_state=42,
+        max_iter=200,
+    )
+    
+    # 在 1Hz 滤波后的数据上拟合，但最终应用在未过度滤波的数据上
+    ica.fit(raw_for_ica, verbose=False)
+    
+    eog_chs =[ch for ch in raw_clean.ch_names if 'EOG' in ch.upper()]
+    detected_components =[]
+    eog_detection_used = False
+
+    if len(eog_chs) > 0:
+        # 基于 EOG 通道检测
+        eog_detection_used = True
+        for eog_ch in eog_chs:
+            try:
+                indices, scores = ica.find_bads_eog(
+                    raw_clean, ch_name=eog_ch, threshold=threshold, measure='zscore', verbose=False
+                )
+                if adaptive_threshold and len(scores) > 0:
+                    abs_scores = np.abs(scores)
+                    median = np.median(abs_scores)
+                    mad = np.median(np.abs(abs_scores - median))
+                    adaptive_thresh = median + 3 * mad
+                    filtered_indices =[i for i, score in enumerate(abs_scores) if score >= adaptive_thresh]
+                    detected_components.extend(filtered_indices)
+                else:
+                    detected_components.extend(indices)
+            except Exception:
+                pass
+    else:
+        # 无 EOG 通道：先尝试用额部 EEG 通道 (Fpz/AFz) 作为"伪 EOG"辅助检测
+        pseudo_eog_candidates = [ch for ch in raw_clean.ch_names if ch.upper() in ['FPZ', 'AFZ', 'FP1', 'FP2']]
+        for pseudo_ch in pseudo_eog_candidates:
+            try:
+                indices, scores = ica.find_bads_eog(
+                    raw_clean, ch_name=pseudo_ch, threshold=threshold * 1.5, measure='zscore', verbose=False
+                )
+                if indices:
+                    detected_components.extend(indices)
+                    eog_detection_used = True
+            except Exception:
+                pass
+
+        # 如果伪 EOG 也没检测到，再用统计降级方案
+        if not detected_components:
+            detected_components = _detect_artifacts_by_statistics(ica, raw_clean, adaptive=adaptive_threshold)
+
+    # 去重并限制最大排除数量
+    unique_components = list(dict.fromkeys(detected_components))
+    final_exclude = unique_components[:max_exclude]
+
+    if not eog_detection_used and not final_exclude:
+        # 无任何 EOG/伪 EOG 参考，且统计方法也没检出 → 保守处理：跳过 ICA 排除
+        # 因为无参考时盲目排除峰度高的成分可能误删有效脑电信号
+        pass
+    
+    metrics = {}
+    if final_exclude:
+        ica.exclude = final_exclude
+        ica.apply(raw_clean, verbose=False)
+        # 注意：必须在 pick_types 前计算 metrics，否则 picks_eeg 索引会越界
+        metrics = _calculate_ica_metrics(raw, raw_clean, picks_eeg, final_exclude)
+        
+    # =========================================================================
+    # 🌟 核心修改 5：在所有处理（包括指标计算）完成后，仅保留 EEG 通道 🌟
+    # =========================================================================
+    raw_clean.pick_types(eeg=True)
+    
+    return raw_clean, metrics
+
+
+def _detect_artifacts_by_statistics(ica, raw_data, adaptive=True):
+    """基于非高斯性（峰度）的统计学伪迹检测"""
+    sources = ica.get_sources(raw_data).get_data()
+    n_components = sources.shape[0]
+
+    kurtosis_scores =[]
+    for i in range(n_components):
+        # 眼电和心电等伪迹具有极高的非高斯性，峰度(Kurtosis)是最佳指标
+        kurt_val = abs(scipy.stats.kurtosis(sources[i]))
+        kurtosis_scores.append(kurt_val)
+
+    kurtosis_scores = np.array(kurtosis_scores)
+
+    if adaptive:
+        # 使用 IQR 自适应阈值，比固定 Z-score 更稳健
+        q1 = np.percentile(kurtosis_scores, 25)
+        q3 = np.percentile(kurtosis_scores, 75)
+        iqr = q3 - q1
+        threshold_val = q3 + 1.5 * iqr
+        artifact_indices = np.where(kurtosis_scores > threshold_val)[0].tolist()
+    else:
+        # 固定 Z-score
+        z_scores = (kurtosis_scores - np.mean(kurtosis_scores)) / (np.std(kurtosis_scores) + 1e-8)
+        artifact_indices = np.where(z_scores > 2.0)[0].tolist()
+
+    # 按异常程度排序
+    artifact_indices.sort(key=lambda idx: kurtosis_scores[idx], reverse=True)
+
+    return artifact_indices
+
+
+def _calculate_ica_metrics(raw_before, raw_after, picks_eeg, excluded_components):
+    """计算纯粹的统计学改善指标"""
+    data_before = raw_before.get_data(picks=picks_eeg)
+    data_after = raw_after.get_data(picks=picks_eeg)
+    
+    # 核心改进 4: 移除了毫无意义的脑电 SNR 计算，改为 Variance Reduction
+    var_before = np.var(data_before, axis=1)
+    var_after = np.var(data_after, axis=1)
+    # 添加 1e-8 避免除以 0 的警告
+    var_reduction = np.mean((var_before - var_after) / (var_before + 1e-8) * 100)
+    
+    rms_before = np.sqrt(np.mean(data_before**2, axis=1))
+    rms_after = np.sqrt(np.mean(data_after**2, axis=1))
+    amp_reduction = np.mean((rms_before - rms_after) / (rms_before + 1e-8) * 100)
+    
+    kurtosis_before = scipy.stats.kurtosis(data_before.flatten())
+    kurtosis_after = scipy.stats.kurtosis(data_after.flatten())
+    kurt_reduction = kurtosis_before - kurtosis_after
+    
+    metrics = {
+        'variance_reduction_percent': float(var_reduction),
+        'amplitude_reduction_percent': float(amp_reduction),
+        'kurtosis_reduction': float(kurt_reduction),
+        'components_excluded': len(excluded_components)
+    }
+    
+    return metrics
+
+# PhysionetMI 四分类运动想象事件配置 (left_hand / right_hand / feet / hands)
+_EPOCH_EVENT_CONFIG = {
+    "names": ("left_hand", "right_hand", "feet", "hands"),
+    "event_id": {
+        "left_hand": 1, "right_hand": 2, "feet": 3, "hands": 4,
+    },
+    "left": "left_hand", "right": "right_hand",
+    "feet": "feet", "hands": "hands",
+}
+
+# BCIC-IV-2a 四分类事件配置 (left_hand / right_hand / feet / tongue)
+_BCI2A_EVENT_CONFIG = {
+    "names": ("left_hand", "right_hand", "feet", "tongue"),
+    "event_id": {
+        "left_hand": 1, "right_hand": 2, "feet": 3, "tongue": 4,
+    },
+    "left": "left_hand", "right": "right_hand",
+    "feet": "feet", "hands": "tongue",
+}
+
+
+def _detect_epoch_event_config(raw, event_config=None):
+    """检查 annotations 是否包含指定四分类事件。"""
+    if event_config is None:
+        event_config = _EPOCH_EVENT_CONFIG
+
+    if raw.annotations is None or len(raw.annotations) == 0:
+        raise ValueError("当前被试没有 annotations，无法创建 epochs")
+
+    descriptions = set(raw.annotations.description.astype(str))
+    if set(event_config["names"]).issubset(descriptions):
+        return event_config
+
+    raise ValueError(
+        f"未识别的运动想象事件标注，期望 {event_config['names']}；"
+        f"实际标注: {sorted(descriptions)}"
+    )
+
+
+def epochs(raw, tmin=-1.0, tmax=5.0, event_config=None):
+    """
+    切分运动想象 Epochs。
+
+    参数:
+        tmin: 事件前截取时长（秒）。负值表示包含事件前的静息期。
+        tmax: 事件后截取时长（秒）。建议大于想象时长，以包含想象结束后的静息期。
+        event_config: 事件配置，默认 PhysionetMI；可传入 BCI-IV-2a 配置。
+    
+    默认 tmin=-1.0, tmax=5.0 覆盖：
+        -1.0~0.0s : 事件前静息（基线）
+         0.0~4.0s : 完整运动想象时段
+         4.0~5.0s : 想象结束后回到静息
+    """
+    raw_copy = raw.copy()
+    config = _detect_epoch_event_config(raw_copy, event_config)
+    event_id = config["event_id"]
+    code_values = list(event_id.values())
+
+    events, _ = mne.events_from_annotations(
+        raw_copy,
+        event_id=event_id,
+    )
+
+    events = events[np.isin(events[:, 2], code_values)]
+    if events.size == 0:
+        raise ValueError(
+            f"当前被试 annotations 中没有四类运动想象事件: {config['names']}"
+        )
+
+    epochs_obj = mne.Epochs(
+        raw_copy,
+        events,
+        event_id=event_id,
+        tmin=tmin,
+        tmax=tmax,
+        baseline=None,
+        preload=True,
+        event_repeated="drop",
+    )
+
+    left_epochs = epochs_obj[config["left"]]
+    right_epochs = epochs_obj[config["right"]]
+    feet_epochs = epochs_obj[config["feet"]]
+    hands_epochs = epochs_obj[config["hands"]]
+
+    # 检查各类别 trial 数量，防止空类别导致后续对齐/拼接失败
+    epoch_counts = {
+        config["left"]: len(left_epochs),
+        config["right"]: len(right_epochs),
+        config["feet"]: len(feet_epochs),
+        config["hands"]: len(hands_epochs),
+    }
+    for name, count in epoch_counts.items():
+        if count == 0:
+            raise ValueError(
+                f"当前被试缺少类别 '{name}' 的 epochs，无法构建四分类数据。"
+                f"各类别数量: {epoch_counts}"
+            )
+
+    return left_epochs, right_epochs, feet_epochs, hands_epochs
+
+
+def preprocess_physionetmi_raw(raw, tmin=-1.0, tmax=3.5):
+    """
+    PhysionetMI 原始 EDF 数据完整预处理管线。
+
+    该流程针对“时序流形轨迹”特征工程做了调整：
+      1. 64 通道 1-45 Hz 宽带带通滤波（为 ICA 提供足够频宽）
+      2. 全脑 64 通道 ICA，自动去除 1-2 个眼动/肌电伪迹成分
+      3. 截取 22 个中央区 EEG 通道（与 BCI IV-2a 对应）
+      4. 22 通道 8-30 Hz 精细带通滤波（μ/β 节律）
+      5. 以任务提示 onset 为 t=0，切分 [-1.0, 3.5]s epoch
+         （包含 1s 静息期和 3.5s 想象期，保留静息→想象的过渡动力学）
+
+    参数:
+        raw: 已加载并拼接的 MNE Raw，annotation 应包含
+             left_hand / right_hand / feet / hands / rest 等
+        tmin: epoch 起始时间（秒），默认 -1.0
+        tmax: epoch 结束时间（秒），默认  3.5
+
+    返回:
+        left_epochs, right_epochs, feet_epochs, hands_epochs
+    """
+    raw_copy = raw.copy()
+
+    # Step 1: 64 通道 1-45 Hz 宽带滤波
+    picks_eeg = mne.pick_types(raw_copy.info, eeg=True, exclude=[])
+    raw_copy.filter(l_freq=1.0, h_freq=45.0, picks=picks_eeg, verbose=False)
+
+    # Step 2: 全脑 64 通道 ICA 去噪
+    raw_ica, _ = ica_denoise(raw_copy)
+
+    # Step 3: 截取 22 个目标通道
+    raw_sel = select_channels_physionetmi(raw_ica)
+
+    # Step 4: 8-30 Hz 精细滤波
+    raw_filt = filter(raw_sel)
+
+    # Step 5: 切分四类 MI epoch
+    return epochs(raw_filt, tmin=tmin, tmax=tmax)
+
+
+def preprocess_bci2a_raw(raw, tmin=-1.0, tmax=3.5):
+    """
+    BCIC-IV-2a 原始数据完整预处理管线。
+
+    BCIC-IV-2a 原生 22 通道，无 EOG，因此 ICA 会降级为统计伪迹检测：
+      1. 22 通道 1-45 Hz 宽带带通滤波
+      2. 22 通道 ICA，自动去除 1-2 个高峰度假迹成分
+      3. 校验并重排 22 个通道顺序
+      4. 22 通道 8-30 Hz 精细带通滤波
+      5. 以任务提示 onset 为 t=0，切分 [-1.0, 3.5]s epoch
+
+    返回:
+        left_epochs, right_epochs, feet_epochs, tongue_epochs
+    """
+    raw_copy = raw.copy()
+
+    # Step 1: 22 通道 1-45 Hz 宽带滤波
+    picks_eeg = mne.pick_types(raw_copy.info, eeg=True, exclude=[])
+    raw_copy.filter(l_freq=1.0, h_freq=45.0, picks=picks_eeg, verbose=False)
+
+    # Step 2: 22 通道 ICA 去噪（无 EOG，统计降级）
+    raw_ica, _ = ica_denoise(raw_copy)
+
+    # Step 3: 校验并重排 22 个目标通道
+    raw_sel = select_channels_physionetmi(raw_ica)
+
+    # Step 4: 8-30 Hz 精细滤波
+    raw_filt = filter(raw_sel)
+
+    # Step 5: 切分四类 MI epoch（第 4 类为 tongue）
+    return epochs(raw_filt, tmin=tmin, tmax=tmax, event_config=_BCI2A_EVENT_CONFIG)

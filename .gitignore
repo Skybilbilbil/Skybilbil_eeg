@@ -1,0 +1,22 @@
+# 数据目录（体积大，不推 GitHub）
+saved_data/
+results/
+trajectory_data/
+CSV files/
+C-/
+D-/
+MAtt_baseline/
+pretest/
+figures/
+visualization/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# IDE / 编辑器
+.vscode/
+
+# 日志与临时文件
+*.log
+*.tmp
