@@ -102,13 +102,17 @@ def ica_denoise(raw, threshold=2.5, max_exclude=2, adaptive_threshold=True):
         return raw_clean, {}
         
     # 核心改进 1: 创建专用于拟合ICA的 1Hz 高通滤波数据（极大地提高ICA分离质量）
-    raw_for_ica = raw_clean.copy().filter(l_freq=1.0, h_freq=None, picks=picks_eeg, verbose=False)
-    
+    #  EOG 通道一并高通（避免直流漂移污染成分），EEG 与 EOG 统一进入 ICA。
+    #  降低计算量：成分数 = EEG 通道数（Physionet 已先选 22 通道）、max_iter 200→100。
+    #  ICA 复杂度 ≈ n_comp²·iter，成分 40→22 约省 70%，通道先选 22 再 ICA 另省 24 倍。
+    picks_ica = mne.pick_types(raw_clean.info, eeg=True, eog=True, exclude=[])
+    raw_for_ica = raw_clean.copy().filter(l_freq=1.0, h_freq=None, picks=picks_ica, verbose=False)
+
     ica = mne.preprocessing.ICA(
-        n_components=min(40, len(picks_eeg)),
+        n_components=len(picks_eeg),   # 成分数 = EEG 通道数（22 通道→22 个成分）
         method='picard',
         random_state=42,
-        max_iter=200,
+        max_iter=100,
     )
     
     # 在 1Hz 滤波后的数据上拟合，但最终应用在未过度滤波的数据上
@@ -277,15 +281,18 @@ def _detect_epoch_event_config(raw, event_config=None):
     )
 
 
-def epochs(raw, tmin=-1.0, tmax=5.0, event_config=None):
+def epochs(raw, tmin=-1.0, tmax=5.0, event_config=None, reject_amp_uv=None):
     """
-    切分运动想象 Epochs。
+    切分运动想象 Epochs，并支持按幅度剔除坏 trial。
 
     参数:
         tmin: 事件前截取时长（秒）。负值表示包含事件前的静息期。
         tmax: 事件后截取时长（秒）。建议大于想象时长，以包含想象结束后的静息期。
         event_config: 事件配置，默认 PhysionetMI；可传入 BCI-IV-2a 配置。
-    
+        reject_amp_uv: peak-to-peak 幅度阈值（µV）。不为 None 时，任一 EEG 通道
+            在 epoch 内峰峰值超过该阈值的 trial 会被剔除（MNE auto_reject）。
+            推荐 100µV（运动伪迹/眨眼），在 8-30Hz 滤波后的干净信号上使用。
+
     默认 tmin=-1.0, tmax=5.0 覆盖：
         -1.0~0.0s : 事件前静息（基线）
          0.0~4.0s : 完整运动想象时段
@@ -307,6 +314,15 @@ def epochs(raw, tmin=-1.0, tmax=5.0, event_config=None):
             f"当前被试 annotations 中没有四类运动想象事件: {config['names']}"
         )
 
+    reject_dict = None
+    if reject_amp_uv is not None:
+        # MNE reject 参数按通道类型（'eeg': 阈值）给出，不按通道名
+        # 量纲自适应：MNE Raw 数据可能以 V 存储（Physionet/BCI2a EDF 原始单位）
+        picks_eeg = mne.pick_types(raw_copy.info, eeg=True, exclude=[])
+        _d = raw_copy.get_data(picks=picks_eeg[:1])
+        scale = 1e-6 if (_d.size and float(np.abs(_d).max()) < 0.01) else 1.0
+        reject_dict = {'eeg': reject_amp_uv * scale}
+
     epochs_obj = mne.Epochs(
         raw_copy,
         events,
@@ -316,6 +332,7 @@ def epochs(raw, tmin=-1.0, tmax=5.0, event_config=None):
         baseline=None,
         preload=True,
         event_repeated="drop",
+        reject=reject_dict,
     )
 
     left_epochs = epochs_obj[config["left"]]
@@ -340,7 +357,7 @@ def epochs(raw, tmin=-1.0, tmax=5.0, event_config=None):
     return left_epochs, right_epochs, feet_epochs, hands_epochs
 
 
-def preprocess_physionetmi_raw(raw, tmin=-1.0, tmax=3.5):
+def preprocess_physionetmi_raw(raw, tmin=-1.0, tmax=3.5, reject_amp_uv=None):
     """
     PhysionetMI 原始 EDF 数据完整预处理管线。
 
@@ -357,36 +374,41 @@ def preprocess_physionetmi_raw(raw, tmin=-1.0, tmax=3.5):
              left_hand / right_hand / feet / hands / rest 等
         tmin: epoch 起始时间（秒），默认 -1.0
         tmax: epoch 结束时间（秒），默认  3.5
+        reject_amp_uv: 峰峰值幅度阈值（µV），剔除超幅坏 trial；None=不剔除
 
     返回:
         left_epochs, right_epochs, feet_epochs, hands_epochs
     """
     raw_copy = raw.copy()
 
-    # Step 1: 64 通道 1-45 Hz 宽带滤波
-    picks_eeg = mne.pick_types(raw_copy.info, eeg=True, exclude=[])
-    raw_copy.filter(l_freq=1.0, h_freq=45.0, picks=picks_eeg, verbose=False)
+    # Step 1: 先截取 22 个目标中央区通道（Physionet 64 通道，其中大量枕叶/额区
+    #   通道对 MI 任务无贡献；先降通道再做 ICA，ICA 计算量按通道数立方下降，
+    #   22³ vs 64³ ≈ 1/24，显著提速）
+    raw_sel = select_channels_physionetmi(raw_copy)
 
-    # Step 2: 全脑 64 通道 ICA 去噪
-    raw_ica, _ = ica_denoise(raw_copy)
+    # Step 2: 22 通道 1-45 Hz 宽带滤波
+    picks_eeg = mne.pick_types(raw_sel.info, eeg=True, exclude=[])
+    raw_sel.filter(l_freq=1.0, h_freq=45.0, picks=picks_eeg, verbose=False)
 
-    # Step 3: 截取 22 个目标通道
-    raw_sel = select_channels_physionetmi(raw_ica)
+    # Step 3: 22 通道 ICA 去噪
+    raw_ica, _ = ica_denoise(raw_sel)
 
     # Step 4: 8-30 Hz 精细滤波
-    raw_filt = filter(raw_sel)
+    raw_filt = filter(raw_ica)
 
-    # Step 5: 切分四类 MI epoch
-    return epochs(raw_filt, tmin=tmin, tmax=tmax)
+    # Step 5: 切分四类 MI epoch（可选幅度剔除）
+    return epochs(raw_filt, tmin=tmin, tmax=tmax, reject_amp_uv=reject_amp_uv)
 
 
-def preprocess_bci2a_raw(raw, tmin=-1.0, tmax=3.5):
+def preprocess_bci2a_raw(raw, tmin=-1.0, tmax=3.5, reject_amp_uv=None):
     """
     BCIC-IV-2a 原始数据完整预处理管线。
 
-    BCIC-IV-2a 原生 22 通道，无 EOG，因此 ICA 会降级为统计伪迹检测：
-      1. 22 通道 1-45 Hz 宽带带通滤波
-      2. 22 通道 ICA，自动去除 1-2 个高峰度假迹成分
+    BCIC-IV-2a 原生 22 个 EEG 通道 + 3 个 EOG 通道（加载器已保留 EOG）：
+      1. 22 通道 1-45 Hz 宽带带通滤波（EOG 不参与滤波）
+      2. 22 通道 ICA，用真实 EOG 通道自动检测
+         并去除 1-2 个眼电伪迹成分（对齐官方 desc_2a 的 EOG 回归清洗
+         A01-A05；ICA 完成后自动 drop EOG，输出纯 EEG）
       3. 校验并重排 22 个通道顺序
       4. 22 通道 8-30 Hz 精细带通滤波
       5. 以任务提示 onset 为 t=0，切分 [-1.0, 3.5]s epoch
@@ -396,11 +418,16 @@ def preprocess_bci2a_raw(raw, tmin=-1.0, tmax=3.5):
     """
     raw_copy = raw.copy()
 
+    # Step 0: 确保 EOG 通道类型正确（供 ica.find_bads_eog 使用）
+    eog_chs = [ch for ch in raw_copy.ch_names if 'EOG' in ch.upper()]
+    if eog_chs:
+        raw_copy.set_channel_types({ch: 'eog' for ch in eog_chs})
+
     # Step 1: 22 通道 1-45 Hz 宽带滤波
     picks_eeg = mne.pick_types(raw_copy.info, eeg=True, exclude=[])
     raw_copy.filter(l_freq=1.0, h_freq=45.0, picks=picks_eeg, verbose=False)
 
-    # Step 2: 22 通道 ICA 去噪（无 EOG，统计降级）
+    # Step 2: 22 通道 ICA 去噪（真实 EOG 参考检测眼电）
     raw_ica, _ = ica_denoise(raw_copy)
 
     # Step 3: 校验并重排 22 个目标通道
@@ -409,5 +436,6 @@ def preprocess_bci2a_raw(raw, tmin=-1.0, tmax=3.5):
     # Step 4: 8-30 Hz 精细滤波
     raw_filt = filter(raw_sel)
 
-    # Step 5: 切分四类 MI epoch（第 4 类为 tongue）
-    return epochs(raw_filt, tmin=tmin, tmax=tmax, event_config=_BCI2A_EVENT_CONFIG)
+    # Step 5: 切分四类 MI epoch（第 4 类为 tongue，可选幅度剔除）
+    return epochs(raw_filt, tmin=tmin, tmax=tmax, event_config=_BCI2A_EVENT_CONFIG,
+                  reject_amp_uv=reject_amp_uv)

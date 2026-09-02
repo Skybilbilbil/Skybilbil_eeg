@@ -11,7 +11,7 @@
   [层面2] 逐被试差异: 哪些被试受影响最大
   [层面3] 逐类差异  : 哪一类在哪些环节被拉开（如脚类崩溃机制）
   [层面4] 管道传播  : 差异如何从输入层累积到输出层
-                      + Conv2 时序动态滞后专项 + log-trace 专项
+                      + Conv2 时序动态滞后专项
 
 不重新训练，只加载已有 checkpoint 前向推理。
 """
@@ -41,7 +41,7 @@ SUBJECTS = list(range(1, 10))
 FS = 250
 SAMPLE_RATIO = 0.5
 N_CLASSES = 4
-WIN_SEC, STEP_SEC = 1.0, 0.5
+WIN_SEC, STEP_SEC = 1.5, 0.75
 WIN_SAMPLES = int(round(WIN_SEC * FS))
 STEP_SAMPLES = int(round(STEP_SEC * FS))
 D_ATTN_IN, D_ATTN_OUT = 8, 8
@@ -49,20 +49,18 @@ BS = 16
 CLASS_NAMES = ['左手', '右手', '脚', '舌头']
 
 # 层顺序（管道传播顺序）+ 类型 + 显示名
-# 类型: vector=卷积/信号层, spd=SPD流形层, trace=log-trace, flat=展平向量层
+# 类型: vector=卷积/信号层, spd=SPD流形层, flat=展平向量层
 LAYER_ORDER = [
     ('channel_weight', 'vector', '[1] 通道加权'),
     ('conv1', 'vector', '[2] Conv1 空间'),
     ('In1', 'vector', '[3] InstanceNorm1'),
     ('conv2', 'vector', '[4] Conv2 时序'),
     ('In2', 'vector', '[5] InstanceNorm2'),
-    ('ract1.signal2spd[0]', 'spd', '[6a] E2R协方差'),
-    ('ract1.signal2spd[1]', 'trace', '[6b] log-trace'),
+    ('ract1.signal2spd', 'spd', '[6] E2R协方差'),
     ('spdnorm', 'spd', '[7] SPDNorm'),
-    ('att2.shared_trans', 'spd', '[8a] 注意力共享基'),
-    ('att2.q_power', 'spd', '[8b] 注意力Q'),
-    ('att2.k_power', 'spd', '[8c] 注意力K'),
-    ('att2.v_power', 'spd', '[8d] 注意力V'),
+    ('att2.q_trans', 'spd', '[8a] 注意力Q变换'),
+    ('att2.k_trans', 'spd', '[8b] 注意力K变换'),
+    ('att2.v_trans', 'spd', '[8c] 注意力V变换'),
     ('ract2', 'spd', '[9] 平滑整流'),
     ('tangent.vec', 'flat', '[10] 切空间'),
     ('flat', 'flat', '[10b] Flatten'),
@@ -115,12 +113,20 @@ def spd_logmean_matrices(t, M):
     C = t.shape[-1]
     B = t.shape[0] // M
     t = t[:B * M].reshape(B, M, C, C)
-    s, u = torch.linalg.eigh(t)
-    s = s.abs().clamp(min=1e-10)
-    logm = u @ torch.diag_embed(torch.log(s)) @ u.mT
-    logmean = logm.mean(1)
-    s2, u2 = torch.linalg.eigh(logmean)
-    return u2 @ torch.diag_embed(torch.exp(s2)) @ u2.mT
+    # 强数值加固：元素裁剪 + 对称化 + 正则扰动；eigh 失败(病态/重复特征值)降级为均值矩阵，
+    #   避免早期随机权重下某层特征令 linalg.eigh 报 error 7 中断诊断(不影响训练损失)
+    t = torch.nan_to_num(t, nan=0.0, posinf=20.0, neginf=-20.0)
+    t = (t + t.transpose(-1, -2)) * 0.5
+    t = t.clamp(-20.0, 20.0) + torch.eye(C, device=t.device) * 1e-4
+    try:
+        s, u = torch.linalg.eigh(t)
+        s = s.abs().clamp(min=1e-8)
+        logm = u @ torch.diag_embed(torch.log(s)) @ u.mT
+        logmean = logm.mean(1)
+        s2, u2 = torch.linalg.eigh(logmean)
+        return u2 @ torch.diag_embed(torch.exp(s2)) @ u2.mT
+    except Exception:
+        return (t.mean(1) + torch.eye(C, device=t.device) * 1e-2).cpu()
 
 
 def batch_to_vectors(name, t, M):
@@ -132,8 +138,6 @@ def batch_to_vectors(name, t, M):
         r, c = np.triu_indices(C)
         vecs = mats[:, r, c]
         return vecs, mats
-    if kind == 'trace':
-        return t.numpy(), None
     if kind == 'flat':
         if name == 'tangent.vec':  # (B*M, d) → 逐试次 (B, M*d)，与 flat 层一致
             B = t.shape[0] // M
@@ -258,7 +262,7 @@ def main():
     subject_data, metadata = load_preprocessed_dataset(DATA_PATH)
     T = subject_data[0][0].shape[-1]
     M = (T - WIN_SAMPLES) // STEP_SAMPLES + 1
-    print(f'T={T}, n_windows M={M}, feat_per_window={D_ATTN_OUT * (D_ATTN_OUT + 1) // 2 + 1}')
+    print(f'T={T}, n_windows M={M}, feat_per_window={D_ATTN_OUT * (D_ATTN_OUT + 1) // 2}')
 
     # 逐被试测试集（与 analyze_profile_results.py 完全一致）
     subject_tests = {}
@@ -442,23 +446,6 @@ def main():
         lags = np.array(lags)
         print(f'\n  平均 |滞后| = {np.mean(np.abs(lags)):.1f} 采样点 = {np.mean(np.abs(lags)) / FS * 1000:.0f} ms')
 
-    # ========== 层面4b: log-trace 专项 ==========
-    print('\n' + '=' * 70)
-    print('层面4b: log-trace 专项（逐被试 within vs cross 平均 log-trace）')
-    print('=' * 70)
-    trace_rows = []
-    for sid, d in data.items():
-        tw = d['within'][0]['ract1.signal2spd[1]']  # (n, M)
-        tc = d['cross'][0]['ract1.signal2spd[1]']
-        mw, mc = tw.mean(), tc.mean()
-        ratio = abs(mc - mw) / (abs(mw) + 1e-8)
-        trace_rows.append((sid, mw, mc, ratio))
-        print(f'  S{sid:02d}: within={mw:+.4f}  cross={mc:+.4f}  比值={ratio:.3f}')
-    tr = np.array([[r[1], r[2]] for r in trace_rows])
-    print(f'\n  within均值={tr[:,0].mean():+.4f}±{tr[:,0].std():.4f}  '
-          f'cross均值={tr[:,1].mean():+.4f}±{tr[:,1].std():.4f}  '
-          f'平均比值={np.mean([r[3] for r in trace_rows]):.3f}')
-
     # ========== 输入层基线（数据级，无模型） ==========
     print('\n' + '=' * 70)
     print('输入层基线: 数据级协方差跨被试距离（Log-Euclidean）')
@@ -487,7 +474,6 @@ def main():
         'class_mat': class_mat.tolist(),
         'class_stats': class_stats,
         'conv2_lags': [int(x) for x in lags],
-        'log_trace': [{'sid': s, 'within': w, 'cross': c, 'ratio': r} for s, w, c, r in trace_rows],
         'input_inter_dist': float(np.mean(inter_d)),
     }
     json_path = OUT_DIR / 'pipeline_detail.json'

@@ -5,13 +5,14 @@
 重新训练三个模型（参数与 profile_10 完全一致），在训练过程中系统性采集：
   ① 训练曲线    : 每迭代 train/val loss、train/val acc、每迭代 test acc、每类 test acc
   ② 参数演化    : 各模块可学习参数范数 + SPDNorm 的 gamma/beta 随训练变化
-  ③ 特征演化    : 每快照点验证集逐层特征（范数/log-trace/SPD log-欧氏均值矩阵）
+  ③ 特征演化    : 每快照点验证集逐层特征（范数/SPD log-欧氏均值矩阵）
   ④ 注意力演化  : 注意力概率矩阵对角线集中度 + 均值矩阵
   ⑤ 可分性演化  : 切空间特征 silhouette（类间可分性）
   ⑥ 梯度诊断    : 每迭代各层梯度范数
   ⑦ 测试过程    : 每快照点 test acc / 每类 acc / 混淆矩阵
 
-全部保存到 results/profile_10/pair_training_*，不覆盖原 checkpoint。
+全部保存到 results/profile_11/pair_training_*，不覆盖原 checkpoint。
+（profile_11 = 恢复全连接 conv2 + 保留 3 处等价优化 + 移除 log_trace 的新基线）
 """
 
 import os, sys, json, time, pickle
@@ -27,12 +28,74 @@ from mAtt.mAtt import mAtt_bci
 from mAtt.optimizer import MixOptimizer
 from analyze_cross_pipeline import (
     FeatureRecorder, batch_to_vectors, LAYER_ORDER, LAYER_DISP,
-    FS, WIN_SAMPLES, STEP_SAMPLES, DEVICE, OUT_DIR,
+    FS, WIN_SAMPLES, STEP_SAMPLES, DEVICE,
     load_preprocessed_dataset, split_train_valid_test, le_mean,
 )
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Device: {DEVICE}')
+
+# ============ 命令行参数：空间滤波器个数 / 输出目录 ============
+import argparse
+_parser = argparse.ArgumentParser()
+_parser.add_argument('--n_spatial_filters', type=int, default=22,
+                     help='conv1 输出空间滤波器个数（22=基线，10/15=压缩版）')
+_parser.add_argument('--out_dir', type=str, default='profile_11', help='输出目录名')
+_parser.add_argument('--tag', type=str, default='trainpair', help='checkpoint 文件名前缀')
+_parser.add_argument('--channel_gaussian', action='store_true',
+                     help='通道加权改用固定 2D 高斯掩膜（C3/Cz/C4 中心，不参与训练）')
+_parser.add_argument('--ortho_lambda', type=float, default=0.0,
+                     help='Conv1 正交性正则系数 λ（0=关闭），L_reg=λ/2·mean(||WWᵀ-I||²)')
+_parser.add_argument('--wd', type=float, default=0.02,
+                     help='weight_decay（对 Adam 直接加进梯度；默认=0.02。0.5 已被证实为跨被试准确率塌缩主因）')
+_parser.add_argument('--seed', type=int, default=None,
+                     help='随机种子（固定 run 可复现；None=不固定，用于多种子统计）')
+_parser.add_argument('--conv2_multiscale', action='store_true',
+                     help='将 Conv2 替换为多尺度并联时间滤波器组(1×8/1×16/1×32/空洞1×16)')
+_parser.add_argument('--conv2_ms_per_branch', type=int, default=None,
+                     help='多尺度每分支输出通道数（None=均分到 d_attn_in；4=扩容后投影回）')
+_parser.add_argument('--conv2_ms_specs', type=str, default=None,
+                     help='多尺度核长组合 e.g. "8_1,16_1,24_1,24_2"（核长_空洞，逗号分隔）')
+_parser.add_argument('--attn_change', type=str, default=None,
+                     help='变化感知模式: None=原始匹配 | ref=显式静息参考(A) | diff=时间差分打分(B)')
+_parser.add_argument('--attn_prior', type=str, default=None,
+                     help='协议先验(逗号分隔,长度=窗口数): 在softmax前对key窗加偏置,'
+                          '提升想象段注意力。e.g. "0,0,0.6,0.6,0.6,0.6,0.6,0.6" (win0静息低, win2-7想象高)')
+_parser.add_argument('--manifold_change', type=str, default=None,
+                     help='SPD 流形"相对变化"特征: None=恒等(绝对SPD) | le_win0=相对窗0静息 | '
+                          'le_diff1=一阶时间差分 | le_diff2=二阶时间差分')
+_args = _parser.parse_args()
+N_SPATIAL_FILTERS = _args.n_spatial_filters
+TAG = _args.tag
+CHANNEL_GAUSSIAN = _args.channel_gaussian
+ORTHO_LAMBDA = _args.ortho_lambda
+WD = _args.wd
+CONV2_MULTISCALE = _args.conv2_multiscale
+CONV2_MS_PER_BRANCH = _args.conv2_ms_per_branch
+CONV2_MS_SPECS = (tuple((int(k), int(d)) for k, d in
+                        (s.split('_') for s in _args.conv2_ms_specs.split(',')))
+                  if _args.conv2_ms_specs else None)
+ATTN_CHANGE = _args.attn_change
+ATTN_PRIOR = (tuple(float(v) for v in _args.attn_prior.split(','))
+              if _args.attn_prior else None)
+if ATTN_PRIOR is not None and len(ATTN_PRIOR) < 8:
+    print(f'[WARN] attn_prior 长度 {len(ATTN_PRIOR)} < 窗口数, 末窗可能缺值')
+MANIFOLD_CHANGE = _args.manifold_change
+
+OUT_DIR = BASE / 'results' / _args.out_dir
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+SEED = _args.seed
+if SEED is not None:
+    import random
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+print(f'[配置] n_spatial_filters={N_SPATIAL_FILTERS} channel_gaussian={CHANNEL_GAUSSIAN} '
+      f'ortho_lambda={ORTHO_LAMBDA} conv2_multiscale={CONV2_MULTISCALE} '
+      f'per_branch={CONV2_MS_PER_BRANCH} specs={CONV2_MS_SPECS}, '
+      f'输出目录: {OUT_DIR}')
 
 DATA_PATH = str(BASE.parent / 'saved_data' / 'preprocessed_data_bci2a_raw_ica.pkl')
 SAMPLE_RATIO = 0.5
@@ -40,9 +103,11 @@ N_CLASSES = 4
 D_ATTN_IN, D_ATTN_OUT = 8, 8
 PAIR_SUBJECTS = [3, 9]
 
-ITERATIONS = 50
-LR, WD, BS = 5e-4, 0.5, 64
+ITERATIONS = 150
+LR, BS = 5e-4, 64
 GRAD_CLIP = 1.0
+LOCAL_RADIUS = 6      # 全连接注意力（M=4 时覆盖全部窗口）；保留原注意力机制的完整交互
+DROP_PROB = 0.3       # dropout（验证过的折中值：0.5 偏重，0.3 平衡效果与正则）
 SNAP_EVERY = 5          # 每 5 迭代一次快照（特征/参数/注意力/可分性/test）
 TEST_EVERY = 5
 
@@ -83,19 +148,38 @@ def load_data():
 
 def make_loaders(X_tr, y_tr, X_va, y_va, X_te, y_te, bs=BS):
     def tl(X, y, shuffle):
+        ds = torch.utils.data.TensorDataset(torch.Tensor(X).unsqueeze(1), torch.Tensor(y).long())
+        # pin_memory：GPU 训练时锁页缓冲，配合 non_blocking 异步传输提速；
+        # 数据已驻留内存(TensorDataset)，num_workers 仅选 2 避免多余进程开销。
         return torch.utils.data.DataLoader(
-            torch.utils.data.TensorDataset(torch.Tensor(X).unsqueeze(1), torch.Tensor(y).long()),
-            batch_size=bs, shuffle=shuffle)
+            ds, batch_size=bs, shuffle=shuffle,
+            pin_memory=True,
+            num_workers=0 if DEVICE.type == 'cpu' else 2,
+            persistent_workers=True if DEVICE.type == 'cuda' else False)
     return tl(X_tr, y_tr, True), tl(X_va, y_va, False), tl(X_te, y_te, False)
+
+
+def _match_param(key, name):
+    """参数分组匹配。普通前缀 startswith；conv2 需跨多尺度分支聚合
+    （conv2.weight/conv2.bias 会漏掉 conv2.convs.N.weight/bias → 改成通配 *）。"""
+    if key in ('conv2.weight', 'conv2.bias'):
+        suffix = '.'.join(key.split('.')[1:])          # weight / bias
+        return (name == key) or (name.startswith('conv2.') and name.endswith('.' + suffix))
+    return name.startswith(key)
 
 
 def param_snapshot(net):
     """记录各模块参数范数 + SPDNorm 仿射"""
     snap = {}
     for key, disp in PARAM_GROUPS:
+        if key == 'channel_weight.scale':
+            # scale 可能是 Parameter（可学习）或 buffer（高斯固定），统一直接读取
+            s = net.channel_weight.scale.detach()
+            snap[disp] = float(s.norm().item()) if s.numel() > 0 else 0.0
+            continue
         tot = 0.0
         for name, p in net.named_parameters():
-            if name.startswith(key):
+            if _match_param(key, name):
                 tot += float(p.detach().norm().item() ** 2)
         snap[disp] = float(np.sqrt(tot)) if tot > 0 else 0.0
     spd = net.spdnorm
@@ -111,7 +195,7 @@ def grad_snapshot(net):
     for key, disp in PARAM_GROUPS:
         tot = 0.0
         for name, p in net.named_parameters():
-            if name.startswith(key) and p.grad is not None:
+            if _match_param(key, name) and p.grad is not None:
                 tot += float(p.grad.norm().item() ** 2)
         snap[disp] = float(np.sqrt(tot)) if tot > 0 else 0.0
     return snap
@@ -157,8 +241,6 @@ def feature_snapshot(net, loader, M):
         }
         if mats is not None:
             stats[name]['logeu_mean'] = le_mean(mats)
-        if name == 'ract1.signal2spd[1]':
-            stats[name]['log_trace_mean'] = float(t.numpy().mean())
 
     sil = None
     if feats_tan and len(np.unique(labels)) >= 2:
@@ -195,10 +277,44 @@ def per_class_acc_conf(net, loader, n_classes=N_CLASSES):
     return acc.tolist(), conf.tolist()
 
 
-def train_with_record(tag, net, tr_ld, va_ld, te_ld, M, ckpt_prefix):
+def conv1_ortho_penalty(net, lam):
+    """Conv1 滤波器正交性正则：L_reg = λ/2 · ||W Wᵀ − I||_F²
+
+    W 为 (n_sp, 22)（每个空间滤波器是一个 22 维通道向量），WWᵀ 是 n_sp×n_sp，
+    强制滤波器两两正交且单位范数（满秩、不缩水）。注意：正交约束是 WWᵀ=I 而非
+    WᵀW=I —— 后者是 22×22 且秩 ≤ n_sp < 22，数学上无法等于单位阵。
+    用 Frobenius 范数平方（各元素平方和，与用户公式一致）；λ=0.02 时初始
+    惩罚约 0.13（≈ CE 的 10%），足以抵抗跨被试的滤波器塌缩又不压制分类。
+    """
+    if lam <= 0:
+        return 0.0
+    w = net.conv1.weight
+    w = w.view(w.shape[0], -1)               # (n_sp, 22)
+    g = w @ w.t()                            # (n_sp, n_sp)
+    eye = torch.eye(g.shape[0], device=g.device)
+    return 0.5 * lam * ((g - eye) ** 2).sum()
+
+
+def train_with_record(tag, net, tr_ld, va_ld, te_ld, M, ckpt_prefix,
+                      ortho_lambda=ORTHO_LAMBDA):
     """训练一个模型并全程记录过程数据"""
     print(f'\n===== 训练 {tag} =====')
     t0 = time.time()
+    # 推断真实窗口数 m（卷积会改变时序长度，硬编码 M 可能与实际不符）
+    net.eval()
+    with torch.no_grad():
+        # 取一个 mini-batch 做前向，经 att2 的 shape 返回获取实际窗口数 m
+        for probe_b, _ in tr_ld:
+            probe_b = probe_b.to(DEVICE)
+            break
+        x = net.channel_weight(probe_b)
+        x = net.In1(net.conv1(x)); x = net.In2(net.conv2(x))
+        spd = net.ract1(x); spd = net.spdnorm(spd)
+        _, shape = net.att2(spd)
+        m_real = shape[1]
+    if m_real and m_real != M:
+        print(f'   [窗口数修正] M={M} → 实际 m={m_real}（卷积后时序长度变化导致）')
+        M = m_real
     CE = nn.CrossEntropyLoss()
     base_opt = torch.optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=LR, weight_decay=WD)
     opt = MixOptimizer(base_opt)
@@ -217,7 +333,7 @@ def train_with_record(tag, net, tr_ld, va_ld, te_ld, M, ckpt_prefix):
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
             n_tr += len(yb)
             out = net(xb)
-            loss = CE(out, yb)
+            loss = CE(out, yb) + conv1_ortho_penalty(net, ortho_lambda)
             opt.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), GRAD_CLIP)
@@ -293,9 +409,19 @@ def main():
         X_tr, y_tr, X_va, y_va, X_te, y_te = splits[sid]
         tr_ld, va_ld, te_ld = make_loaders(X_tr, y_tr, X_va, y_va, X_te, y_te)
         net = mAtt_bci(WIN_SAMPLES, STEP_SAMPLES, n_classes=N_CLASSES,
-                       d_attn_in=D_ATTN_IN, d_attn_out=D_ATTN_OUT, n_windows=M).to(DEVICE)
+                       d_attn_in=D_ATTN_IN, d_attn_out=D_ATTN_OUT, n_windows=None,
+                       n_spatial_filters=N_SPATIAL_FILTERS,
+                       channel_gaussian=CHANNEL_GAUSSIAN,
+                       conv2_multiscale=CONV2_MULTISCALE,
+                       conv2_ms_per_branch=CONV2_MS_PER_BRANCH,
+                       conv2_ms_specs=CONV2_MS_SPECS,
+                       local_radius=LOCAL_RADIUS,
+                       attn_change=ATTN_CHANGE,
+                       attn_prior=ATTN_PRIOR,
+                       manifold_change=MANIFOLD_CHANGE).to(DEVICE)
+        net.dropout = nn.Dropout(DROP_PROB)
         rec = train_with_record(f'S{sid:02d} 被试内', net, tr_ld, va_ld, te_ld, M,
-                                f'trainpair_within_S{sid}')
+                                f'{TAG}_within_S{sid}')
         results['models'][f'within_S{sid}'] = {'tag': f'S{sid} 被试内', **rec}
         del net
 
@@ -303,9 +429,19 @@ def main():
     X_tr, y_tr, X_va, y_va, X_te, y_te = cross_split
     tr_ld, va_ld, te_ld = make_loaders(X_tr, y_tr, X_va, y_va, X_te, y_te)
     net = mAtt_bci(WIN_SAMPLES, STEP_SAMPLES, n_classes=N_CLASSES,
-                   d_attn_in=D_ATTN_IN, d_attn_out=D_ATTN_OUT, n_windows=M).to(DEVICE)
+                   d_attn_in=D_ATTN_IN, d_attn_out=D_ATTN_OUT, n_windows=None,
+                   n_spatial_filters=N_SPATIAL_FILTERS,
+                   channel_gaussian=CHANNEL_GAUSSIAN,
+                   conv2_multiscale=CONV2_MULTISCALE,
+                   conv2_ms_per_branch=CONV2_MS_PER_BRANCH,
+                   conv2_ms_specs=CONV2_MS_SPECS,
+                   local_radius=LOCAL_RADIUS,
+                   attn_change=ATTN_CHANGE,
+                   attn_prior=ATTN_PRIOR,
+                   manifold_change=MANIFOLD_CHANGE).to(DEVICE)
+    net.dropout = nn.Dropout(DROP_PROB)
     rec = train_with_record('9人混合跨被试', net, tr_ld, va_ld, te_ld, M,
-                            'trainpair_cross_mix')
+                            f'{TAG}_cross_mix')
     results['models']['cross_mix'] = {'tag': '9人混合跨被试', **rec}
 
     # 保存
@@ -331,9 +467,6 @@ def json_slim(results):
         if 'features' in r:
             sr['features_norm_traj'] = [
                 {name: st['norm_mean'] for name, st in fs.items()} for fs in r['features']]
-            sr['features_logtrace_traj'] = [
-                {name: st['log_trace_mean'] for name, st in fs.items() if 'log_trace_mean' in st}
-                for fs in r['features']]
         slim['models'][k] = sr
     return slim
 
@@ -383,8 +516,8 @@ def make_plots(results):
     fig.tight_layout(); fig.savefig(OUT_DIR / 'pair_training_param_evo.png', dpi=130)
     plt.close(fig)
 
-    # 图3: 特征演化（关键层 norm + log-trace）
-    key_layers = ['conv1', 'conv2', 'ract1.signal2spd[1]', 'spdnorm', 'tangent.vec', 'linear']
+    # 图3: 特征演化（关键层 norm）
+    key_layers = ['conv1', 'conv2', 'spdnorm', 'tangent.vec', 'linear']
     disp = {n: LAYER_DISP[n] for n, _, _ in LAYER_ORDER}
     fig, axes = plt.subplots(len(model_keys), 1, figsize=(13, 3.2 * len(model_keys)), squeeze=False)
     for ai, k in enumerate(model_keys):

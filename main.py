@@ -38,7 +38,7 @@ def main():
 
     for subj_id in tqdm(VALID_SUBJECTS, desc="处理被试"):
         try:
-            left, right, feet, hands = load_subject_mi_trials(subj_id)
+            left, right, feet, hands = load_subject_mi_trials(subj_id, reject_amp_uv=250.0)
         except Exception as e:
             print(f"\n⚠️ 被试 S{subj_id:03d} 加载失败: {e}，已跳过")
             continue

@@ -9,6 +9,7 @@ MAtt 跨被试泛化实验入口（滑动时间窗 + 稀疏流形注意力版）
 import sys
 import json
 import torch
+import torch.nn as nn
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -33,20 +34,21 @@ CONFIG = {
     'repeat': 1,
     'n_classes': 4,
     'lr': 5e-4,
-    'wd': 0.5,                                # 加大正则化（← 0.01）
+    'wd': 0.02,                               # 跨被试主因修正：0.5(塌缩)→0.02
     'iterations': 200,   # 数据量大，设大一点；早停会自动提前结束
     'patience': 15,      # 验证指标连续 15 轮不提升就早停
     'grad_clip': 1.0,    # 梯度裁剪（注意力 α=-d² 不压缩，靠此保证稳定）
     'bs': 64,            # 数据量大，batch size 可以放大（看显存，可调到 32/64/128）
 
     # --- 滑动时间窗（E2R）---
-    'win_sec': 1.0,      # 窗长 1s
-    'step_sec': 0.5,     # 步长 0.5s（50% 重叠）
+    'win_sec': 1.5,      # 窗长 1.5s
+    'step_sec': 0.75,    # 步长 0.75s（50% 重叠）
 
     # --- 稀疏流形注意力 ---
-    'local_radius': 1,   # 局部注意力半径（窗口数）
-    'anchor_stride': None,  # None=仅起始窗口为锚点
+    'local_radius': 6,   # 全连接注意力（窗口数 4~5 时覆盖全部）
+    'anchor_stride': None,  # None=无锚点（纯局部注意力，用户要求删除锚点）；int k=每 k 窗一个锚点
     'n_heads': 1,        # >1 时 K/V 单组共享（GQA）
+    'dropout': 0.3,      # dropout 概率
 
     'model_path': './results/cross_subject_checkpoint/',
     'data_path': '../saved_data/preprocessed_data_moabb_raw_ica.pkl',
@@ -94,8 +96,9 @@ def main():
         local_radius=args['local_radius'],
         anchor_stride=args['anchor_stride'],
         n_heads=args['n_heads'],
-        n_windows=n_windows,
+        n_windows=None,          # LazyLinear 自适应实际窗口数（卷积改变时序长度）
     )
+    net.dropout = nn.Dropout(args.get('dropout', 0.3))
     if torch.cuda.is_available():
         net = net.cuda()
         print(f'使用 GPU: {torch.cuda.get_device_name(0)}')
@@ -108,7 +111,7 @@ def main():
                     if k not in ['bs', 'data_path', 'seen_subjects', 'unseen_subjects',
                                  'seen_test_ratio', 'valid_ratio', 'sample_ratio',
                                  'win_sec', 'step_sec', 'local_radius',
-                                 'anchor_stride', 'n_heads', 'n_classes']}
+                                 'anchor_stride', 'n_heads', 'n_classes', 'dropout']}
     history, best_loss_path, best_acc_path = trainNetwork(
         net, trainloader, validloader, seen_test_loader, **train_kwargs
     )
@@ -121,8 +124,9 @@ def main():
             local_radius=args['local_radius'],
             anchor_stride=args['anchor_stride'],
             n_heads=args['n_heads'],
-            n_windows=n_windows,
+            n_windows=None,
         )
+        m.dropout = nn.Dropout(args.get('dropout', 0.3))
         m.load_state_dict(torch.load(path, map_location='cpu'))
         return m.cuda() if torch.cuda.is_available() else m
 

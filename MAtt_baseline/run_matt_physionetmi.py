@@ -4,6 +4,7 @@ MAtt 在 PhysionetMI 预处理数据上的运行脚本（滑动时间窗 + 稀�
 """
 
 import torch
+import torch.nn as nn
 import json
 from pathlib import Path
 
@@ -23,20 +24,21 @@ CONFIG = {
     'sub': 1,                  # 被试编号（PhysionetMI: 1~103；BCIC-IV-2a: 1~9）
     'n_classes': 4,            # 类别数（两数据集均为 4 分类）
     'lr': 5e-4,                # 学习率
-    'wd': 0.1,                 # weight decay（过拟合可增大，如 0.3~0.5）
-    'iterations': 150,         # 训练迭代次数（过拟合可减小，如 50~100）
+    'wd': 0.02,                # weight decay（已验证 0.02 避免跨被试塌缩）
+    'iterations': 120,         # 训练迭代次数（平衡计算量与效果）
     'grad_clip': 1.0,          # 梯度裁剪 max_norm（注意力 α=-d² 不压缩，靠此保证稳定）
-    'bs': 16,                  # batch size
+    'bs': 64,                  # batch size
     'patience': 0,             # 早停耐心值：0 表示禁用早停
 
     # --- 滑动时间窗（E2R）---
-    'win_sec': 1.0,            # 窗长 1s
-    'step_sec': 0.5,           # 步长 0.5s（50% 重叠）
+    'win_sec': 1.5,            # 窗长 1.5s
+    'step_sec': 0.75,          # 步长 0.75s（50% 重叠）
 
     # --- 稀疏流形注意力 ---
-    'local_radius': 1,         # 局部注意力半径（窗口数）：|i-j| <= r 的对参与注意力
-    'anchor_stride': None,     # None=仅起始窗口为锚点；int k=每 k 个窗口一个锚点（含末窗口）
+    'local_radius': 6,         # 全连接注意力（窗口数 4~5 时覆盖全部）
+    'anchor_stride': None,     # None=无锚点（纯局部注意力，用户要求删除锚点）；int k=每 k 窗一个锚点（含末窗口）
     'n_heads': 1,              # 注意力头数；>1 时 K/V 单组共享（GQA）
+    'dropout': 0.3,            # dropout 概率（0.3 平衡正则与效果）
 
     'model_path': './results/checkpoint/',
     'data_path': None,         # None 时根据 dataset 自动选择默认路径
@@ -98,8 +100,9 @@ def main():
         local_radius=args['local_radius'],
         anchor_stride=args['anchor_stride'],
         n_heads=args['n_heads'],
-        n_windows=n_windows,
+        n_windows=None,          # LazyLinear 自适应实际窗口数（卷积改变时序长度）
     )
+    net.dropout = nn.Dropout(args.get('dropout', 0.3))
     if torch.cuda.is_available():
         net = net.cuda()
         print(f'使用 GPU: {torch.cuda.get_device_name(0)}')
@@ -109,7 +112,8 @@ def main():
     # 训练（新参数不属于 trainNetwork，排除之）
     train_kwargs = {k: v for k, v in args.items()
                     if k not in ['bs', 'data_path', 'win_sec', 'step_sec',
-                                 'local_radius', 'anchor_stride', 'n_heads', 'n_classes']}
+                                 'local_radius', 'anchor_stride', 'n_heads', 'n_classes',
+                                 'dropout']}
     history, best_loss_path, best_acc_path = trainNetwork(
         net, trainloader, validloader, testloader,
         silhouette_interval=5,
@@ -124,8 +128,9 @@ def main():
             local_radius=args['local_radius'],
             anchor_stride=args['anchor_stride'],
             n_heads=args['n_heads'],
-            n_windows=n_windows,
+            n_windows=None,
         )
+        m.dropout = nn.Dropout(args.get('dropout', 0.3))
         m.load_state_dict(torch.load(path, map_location='cpu'))
         return m.cuda() if torch.cuda.is_available() else m
 

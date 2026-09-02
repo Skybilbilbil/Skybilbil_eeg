@@ -9,7 +9,10 @@ import numpy as np
 
 
 def _move_to_device(xb, yb, device):
-    return xb.float().to(device), yb.long().to(device)
+    # GPU 训练用 pin_memory + non_blocking 实现 CPU→GPU 异步复制，
+    # 避免每次 batch 阻塞等待拷贝完成（DataLoader 已开 pin_memory 时收益最大）。
+    nb = device.type == 'cuda'
+    return xb.float().to(device, non_blocking=nb), yb.long().to(device, non_blocking=nb)
 
 
 def _silhouette_with_pca(feats, labels, max_components=15, var_ratio=0.9):
@@ -255,7 +258,7 @@ def save_visualization_data(net, testloader, history, test_acc, args, criterion=
     with torch.no_grad():
         x1 = net.conv1(xb_raw); x1 = net.In1(x1)
         x2 = net.conv2(x1); x2 = net.In2(x2)
-        spd_matrices, _ = net.ract1(x2)
+        spd_matrices = net.ract1(x2)
 
         # 注意力概率直接复用模型内部实现（α=-d²、稀疏对、行归一化），避免与 forward 不同步
         atten_prob = net.att2.attention_prob(spd_matrices)
@@ -281,7 +284,7 @@ def save_visualization_data(net, testloader, history, test_acc, args, criterion=
 
             x1_all = net.conv1(xb_all); x1_all = net.In1(x1_all)
             x2_all = net.conv2(x1_all); x2_all = net.In2(x2_all)
-            spd_all, _ = net.ract1(x2_all)
+            spd_all = net.ract1(x2_all)
 
             ap_all = net.att2.attention_prob(spd_all)
 

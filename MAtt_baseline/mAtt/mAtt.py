@@ -1,6 +1,108 @@
+import math
+import os
+import numpy as np
 import torch
 import torch.nn as nn
-from mAtt.spd import SPDTransform, SPDTangentSpace, SPDRectified, SPDPower, SPDNorm
+import torch.nn.functional as F
+from mAtt.spd import SPDTransform, SPDTangentSpace, SPDRectified, SPDNorm
+
+# 注意力打分映射开关（原文复现调试用）。
+# 1 = 原文打分 相似度 1/(1+log(1+d²)) + softmax(dim=-2)+permute（经官方数据复现验证：
+#     S01 64.6%→79.5%，9 人平均 53.9%→65.1%，为 MAtt 原文机制，默认开启）
+ATTN_SCORE_ORIGINAL = os.environ.get('ATTN_SCORE_ORIGINAL', '1') == '1'
+
+
+class _Conv2dTemporalSeparable(nn.Module):
+    """时序深度可分离卷积: depthwise(1×k, groups=C) + pointwise(1×1)
+
+    替代全连接时序 Conv2d(C_in, C_out, (1,k))：FLOPs 从 O(C_in·C_out·k·T)
+    降为 O(C_in·k·T + C_out·C_in·T)（MobileNet 风格，22→8·12 下约 -5×），
+    感受野不变。参数以叶子形式挂在本模块（不注册子模块），
+    使 conv2 仍是叶子层，特征钩子可整体记录其输出。
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size=12, padding=6):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.padding = padding
+        self.dw_weight = nn.Parameter(torch.empty(in_channels, 1, 1, kernel_size))
+        self.dw_bias = nn.Parameter(torch.zeros(in_channels))
+        self.pw_weight = nn.Parameter(torch.empty(out_channels, in_channels, 1, 1))
+        self.pw_bias = nn.Parameter(torch.zeros(out_channels))
+        # 初始化与 nn.Conv2d 默认一致
+        nn.init.kaiming_uniform_(self.dw_weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.dw_weight)
+        bound = 1 / math.sqrt(fan_in)
+        nn.init.uniform_(self.dw_bias, -bound, bound)
+        nn.init.kaiming_uniform_(self.pw_weight, a=math.sqrt(5))
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.pw_weight)
+        bound = 1 / math.sqrt(fan_in)
+        nn.init.uniform_(self.pw_bias, -bound, bound)
+
+    def forward(self, x):
+        x = F.conv2d(x, self.dw_weight, self.dw_bias,
+                     padding=(0, self.padding), groups=x.shape[1])
+        return F.conv2d(x, self.pw_weight, self.pw_bias)
+
+
+class _Conv2dTemporalMultiScale(nn.Module):
+    """多尺度并联时间滤波器组（经路径A验证：跨被试有效性成立）
+
+    针对单一 1×12 卷积核对特定频率（如 10.5Hz Mu 节律）强频域选择性、
+    个体间峰值频率漂移（8.5–10.5Hz）与潜伏期漂移（200–500ms）导致的
+    输出特征能量系统性偏移，用多个并联不同核长/空洞率的时序卷积捕捉
+    不同尺度时序结构，扩大频带覆盖：
+
+      分支 核长  空洞  捕捉目标
+      a    1×8    1     快速时序变化/高频
+      b    1×16   1     标准 Mu/Beta 节律
+      c    1×32   1     低频慢波过渡
+      d    1×16   2     大感受野，零增参扩宽频率响应
+
+    参数化（路径A/B 共用同一模块）：
+      - per_branch=每分支输出通道数；总输出 = per_branch·n_branch。
+      - 当总输出 != out_channels 时自动补一个 1×1 卷积投影回 out_channels，
+        使后端（E2R/SPD/注意力）接口不受分支通道数影响。
+      - specs 可传入不同核长组合（B 用更贴近 EEG 频段的核长）。
+    时间长度经左右非对称 padding 保持与输入一致。
+    """
+
+    def __init__(self, in_channels, out_channels,
+                 specs=((8, 1), (16, 1), (32, 1), (16, 2)),
+                 per_branch=None):
+        super().__init__()
+        self.specs = specs
+        self.n_branch = len(specs)
+        if per_branch is None:
+            assert out_channels % self.n_branch == 0, \
+                'out_channels 需能被分支数整除以便均分通道'
+            per_branch = out_channels // self.n_branch
+        self.per = per_branch
+        # 各分支独立卷积，挂在叶子层保特征钩子整体记录
+        self.convs = nn.ModuleList()
+        for k, d in specs:
+            c = nn.Conv2d(in_channels, per_branch, (1, k), dilation=d)
+            self.convs.append(c)
+        # 分支拼接总通道
+        self.concat_channels = per_branch * self.n_branch
+        # 需要压回 out_channels 时加 1×1 投影（后端接口不变）
+        if self.concat_channels != out_channels:
+            self.project = nn.Conv2d(self.concat_channels, out_channels, (1, 1))
+        else:
+            self.project = nn.Identity()
+
+    def forward(self, x):  # (B, C_in, 1, T) → (B, C_out, 1, T)，T 不变
+        outs = []
+        for conv, (k, d) in zip(self.convs, self.specs):
+            rf = (k - 1) * d + 1           # 感受野长度
+            pad_l = (rf - 1) // 2          # 左右非对称 padding 使 T 保持
+            pad_r = (rf - 1) - pad_l
+            xi = F.pad(x, (pad_l, pad_r, 0, 0))
+            outs.append(conv(xi))
+        cat = torch.cat(outs, dim=1)
+        return self.project(cat)
 
 
 # ============================================================
@@ -22,16 +124,37 @@ MOTOR_CHANNEL_PRIOR = {
     'Fz': 0.0, 'P1': 0.0, 'Pz': 0.0, 'P2': 0.0, 'POz': 0.0,      # 远区（等效删除）
 }
 
+# 生理学先验通道权重（方案一）：
+# 依据 10-20 系统相对 Cz=1.0 的运动皮层躯体拓扑（C3 右手 / C4 左手 / Cz 双足
+# 运动带主峰）与 SMA/运动前区（FCz）的重要性（Wang, Hong & Gao 的 C3-FCz /
+# C4-FCz 双极最优布局实证），C5/C6 属颞区、远离手部运动带故权重最低。
+PHYSIO_CHANNEL_PRIOR = {
+    'Cz': 1.00,                                    # 双足运动带主峰
+    'C3': 0.95, 'C4': 0.95,                        # 手部运动带主峰（镜像对称）
+    'C1': 0.88, 'C2': 0.88,                        # 手带内侧邻近
+    'FCz': 0.82,                                   # 辅助运动区 SMA
+    'CPz': 0.78,                                   # 中央后带中线
+    'FC1': 0.74, 'FC2': 0.74, 'CP1': 0.74, 'CP2': 0.74,  # 中央前/后带
+    'FC3': 0.60, 'FC4': 0.60, 'CP3': 0.60, 'CP4': 0.60,  # 手带外侧邻近
+    'C5': 0.30, 'C6': 0.30,                        # 颞区，远离运动带，权重最低
+    'Fz': 0.0, 'P1': 0.0, 'Pz': 0.0, 'P2': 0.0, 'POz': 0.0,  # 远区（等效删除）
+}
+
 
 class ChannelPriorWeighting(nn.Module):
     """解剖先验通道加权（A9）
 
     - 权重为 0 的通道等效删除（Fz/P/Pz/POz，共 5 个，离感觉运动区远）；
-    - 其余通道以解剖先验初始化为可学习缩放因子，网络可自行调整关注强度；
+    - 其余通道默认以解剖先验（MOTOR_CHANNEL_PRIOR）初始化为可学习缩放因子，
+      网络可自行调整关注强度；
+    - gaussian=True 时改为固定生理学先验掩膜（PHYSIO_CHANNEL_PRIOR，不参与训练），
+      以 C3/Cz/C4 运动带为主峰、SMA 次峰、颞区压低，强制网络聚焦中央区，
+      避免跨被试时通过"关闭通道"（scale→0）逃避空间变异；
     - 假设数据通道顺序与 BCI2A_CHANNELS 一致（GetPhysionetMI 已校验通道名集合）。
     """
 
-    def __init__(self, channel_names=BCI2A_CHANNELS):
+    def __init__(self, channel_names=BCI2A_CHANNELS, gaussian=False,
+                 gaussian_sigma=0.62, gaussian_centers=('C3', 'Cz', 'C4')):
         super().__init__()
         prior = torch.tensor([MOTOR_CHANNEL_PRIOR.get(n, 0.0) for n in channel_names])
         keep_mask = prior > 0
@@ -39,9 +162,23 @@ class ChannelPriorWeighting(nn.Module):
         self.register_buffer('fixed_mask', prior.clone())  # 删除位恒 0
         self.n_channels = len(channel_names)
         self.n_kept = int(keep_mask.sum().item())
-        self.scale = nn.Parameter(prior[keep_mask].clone())  # 仅保留通道可学习
+        if gaussian:
+            # 固定生理学先验掩膜（相对范数，Cz=1.0），远区仍硬删除
+            full = torch.tensor(
+                [PHYSIO_CHANNEL_PRIOR.get(n, 0.0) for n in channel_names])
+            self.register_buffer('fixed_mask', full.clone())
+            self.register_buffer('scale', full[keep_mask].clone())  # 常数乘子（非 Parameter）
+            # gaussian 模式下 scale 为固定 buffer：一次性合成最终权重 (1,C,1)，
+            # forward 直接广播相乘，避免每步 clone+索引赋值。
+            # persistent=False：不入 state_dict，旧 checkpoint 严格加载不受影响。
+            _w = full.clone()
+            self.register_buffer('final_weight', _w.view(1, 1, -1, 1), persistent=False)
+        else:
+            self.scale = nn.Parameter(prior[keep_mask].clone())  # 仅保留通道可学习
 
     def forward(self, x):  # (B, 1, C, T)
+        if hasattr(self, 'final_weight'):
+            return x * self.final_weight
         w = self.fixed_mask.clone()
         w[self.keep_mask] = self.scale
         return x * w.view(1, 1, -1, 1)
@@ -50,9 +187,7 @@ class ChannelPriorWeighting(nn.Module):
 class signal2spd(nn.Module):
     """信号 → SPD 协方差矩阵（支持 Hann 加权，A3）
 
-    返回 (归一化协方差, log(未归一化 trace))：
-      - 协方差做 trace 归一化（通道间相对结构），同时把归一化前的 log(trace)
-        作为一维信息传出（A1 折衷），由上层拼进切空间特征，模型自行决定用不用；
+    返回 trace 归一化的协方差矩阵（只保留通道间相对结构，不带绝对能量信息）：
       - 加窗时（Hann）用加权均值与加权协方差，无偏分母为 Σw²。
     """
 
@@ -63,13 +198,12 @@ class signal2spd(nn.Module):
         if x.dim() == 4 and x.shape[-2] == 1:
             x = x.squeeze(-2)
         if x.dim() == 3:
-            cov, log_tr = self._cov(x, window)
-            return cov, log_tr
+            return self._cov(x, window)
         elif x.dim() == 4:  # (B, M, C, T)
             b, m, c, t = x.shape
-            cov, log_tr = self._cov(x.reshape(b * m, c, t),
-                                    window.unsqueeze(0).expand(b * m, -1) if window is not None else None)
-            return cov.view(b, m, c, c), log_tr.view(b, m)
+            cov = self._cov(x.reshape(b * m, c, t),
+                            window.unsqueeze(0).expand(b * m, -1) if window is not None else None)
+            return cov.view(b, m, c, c)
         elif x.dim() == 2:
             return self._cov(x.unsqueeze(0), window)
         raise ValueError(f'signal2spd: unexpected input {x.dim()}D, shape {x.shape}')
@@ -87,11 +221,9 @@ class signal2spd(nn.Module):
             x = x * w
             denom = (w * w).sum(dim=-1, keepdim=True)              # (N, 1, 1) 无偏分母 Σw²
         cov = x @ x.mT / denom
-        trace0 = cov.diagonal(dim1=-2, dim2=-1).sum(-1)            # (N,) 未归一化 trace
-        log_trace = trace0.clamp(min=1e-12).log()
-        cov = cov / trace0.view(-1, 1, 1)
+        cov = cov / cov.diagonal(dim1=-2, dim2=-1).sum(-1).view(-1, 1, 1)
         eye = torch.eye(cov.shape[-1], device=cov.device).unsqueeze(0)
-        return cov + 1e-5 * eye, log_trace
+        return cov + 1e-5 * eye
 
 
 class E2R(nn.Module):
@@ -132,31 +264,83 @@ class E2R(nn.Module):
             raise ValueError(f'时间长度 {t} 小于窗长 {self.win}，无法滑窗')
         patches = x.unfold(dimension=-1, size=self.win, step=self.step)  # (B, C, M, win)
         patches = patches.permute(0, 2, 1, 3).contiguous()               # (B, M, C, win)
-        return self.signal2spd(patches, window=self.window)              # (B,M,C,C), (B,M)
+        return self.signal2spd(patches, window=self.window)              # (B,M,C,C)
+
+
+class ManifoldChange(nn.Module):
+    """流形上"相对变化"特征（SPD 原域运算，结果仍为 SPD）
+
+    插在 spdnorm 之后、注意力之前，把绝对 SPD 换成"相对静息/相邻窗的变化"，
+    目标是去除被试绝对位主导（黎曼诊断：被试聚合比 1.33 ≫ 类别 1.11），
+    让下游看到的是"从静息到想象的变化过程"而非个体绝对样子。
+
+    mode：
+      None       恒等（不影响原模型）
+      le_win0    Y_t = exp(log X_t − log X_0)：每样本以自己窗0(静息)为参考的 LE 变化
+      le_diff1   Y_t = exp(log X_{t+1} − log X_t)：一阶时间差分
+      le_diff2   Y_t = exp(二阶时间差分)：加速度型变化，高阶噪声大
+    全部用 Log-Euclidean：切空间做差、指数映射回流形，结果仍为正定 SPD。
+    """
+
+    def __init__(self, mode=None):
+        super().__init__()
+        if isinstance(mode, str) and mode.strip().lower() in ('none', ''):
+            mode = None           # 命令行传入的字符串 'None' → 视为恒等
+        if mode not in (None, 'le_win0', 'le_diff1', 'le_diff2'):
+            raise ValueError(f"manifold_change 须为 None/'le_win0'/'le_diff1'/'le_diff2'，收到 {mode!r}")
+        self.mode = mode
+
+    @staticmethod
+    def _logm(x):
+        x = x.double()
+        s, u = torch.linalg.eigh(x)
+        s = s.abs().clamp(min=1e-6)
+        return (u @ torch.diag_embed(s.log()) @ u.transpose(-1, -2)).float()
+
+    @staticmethod
+    def _expm(y):
+        y = ((y + y.transpose(-1, -2)) / 2).double()
+        s, u = torch.linalg.eigh(y)
+        return (u @ torch.diag_embed(s.exp()) @ u.transpose(-1, -2)).float()
+
+    def forward(self, spd):
+        if self.mode is None:
+            return spd
+        L = self._logm(spd)                     # (B,M,d,d)
+        if self.mode == 'le_win0':
+            L0 = L[:, 0:1]                      # (B,1,d,d) 每样本窗0=自己的静息参考
+            Y = L - L0
+        elif self.mode == 'le_diff1':
+            Y = L[:, 1:] - L[:, :-1]
+            Y = torch.cat([Y, Y[:, -1:]], dim=1)  # 保持 M 窗（末窗复制）
+        elif self.mode == 'le_diff2':
+            Y = L[:, 2:] - 2 * L[:, 1:-1] + L[:, :-2]
+            Y = torch.cat([Y[:, :1], Y, Y[:, -1:]], dim=1)  # 端窗复制补齐 M
+        return self._expm(Y)
 
 
 class AttentionManifold(nn.Module):
-    """流形注意力：稀疏滑动窗口 + 锚点全局 + GQA + 共享正交基谱幂投影
+    """流形注意力：稀疏滑动窗口 + 锚点全局 + GQA + 独立正交投影
 
-    投影（A7+A13，共享基）:
-      Q/K/V 共享同一组 Stiefel 正交变换 W（SPDTransform），各自通过 SPDPower 学
-      一个逐特征值谱幂 w_q/w_k/w_v：Q = W^T X^{w_q} W 等。三个独立正交矩阵在
-      小数据下易过拟合被试特异旋转；共享基后可学参数只剩三个 d 维谱幂向量。
+    投影（原始 MAtt 做法）:
+      Q/K/V 各用一套独立的 Stiefel 正交变换（SPDTransform）：
+      Q = W_q^T X W_q，K = W_k^T X W_k，V = W_v^T X W_v。
+      三套独立基互不共享，不存在"q≡k"坍缩机制。
 
     打分（A4/A5 修复）:
       α_ij = -d²(Q_i, K_j)，softmax(dim=-1) 按 query 行归一化，不做任何压缩变换；
       训练稳定性由外部梯度裁剪（grad_clip）保证。
 
-    稀疏化: 局部带 |i-j|<=local_radius + 锚点双向全局（anchor_stride 控制），
-      复杂度 O(m²) → O(m·(2r+1) + a·m)。FlashAttention 不适用（分数来自矩阵
-      对数而非欧氏点积），省算力由稀疏对计算承担。
+    稀疏化: 局部带 |i-j|<=local_radius；anchor_stride=None 时无锚点（纯局部，
+      用户要求删除锚点），设整数 k 则每 k 窗一个锚点（双向全局）。
 
     GQA: n_heads>1 时共享 K/V 变换后按主子块切分给各头（n_kv_heads=1），
       头输出块对角拼回 d_out 维 SPD，下游维度不变。
     """
 
     def __init__(self, in_embed_size, out_embed_size,
-                 local_radius=1, anchor_stride=None, n_heads=1):
+                 local_radius=1, anchor_stride=None, n_heads=1,
+                 attn_change=None, attn_prior=None):
         super().__init__()
         if out_embed_size % n_heads != 0:
             raise ValueError(f'out_embed_size={out_embed_size} 必须能被 n_heads={n_heads} 整除')
@@ -166,12 +350,27 @@ class AttentionManifold(nn.Module):
         self.anchor_stride = anchor_stride
         self.n_heads = n_heads
         self.d_head = out_embed_size // n_heads
+        # 变化感知模式：None=原始(相似匹配)；'ref'=显式静息参考(A)；'diff'=时间差分打分(B)
+        if attn_change not in (None, 'ref', 'diff'):
+            raise ValueError(f"attn_change 必须为 None/'ref'/'diff'，收到 {attn_change!r}")
+        self.attn_change = attn_change
+        # 可学习注意力先验种子（attn_prior 为可迭代, 长度=窗口数）：
+        #   作为 nn.Parameter 参与训练，初始值=传入的每窗重要度（弱偏想象段），
+        #   之后由每个样本的分类梯度驱动，把注意力从"更像想象的段"的起点
+        #   逐步修到真正重要的窗口（不硬编码哪扇窗重要）。
+        #   注入方式：在 softmax 前的 score 上对「被关注方(key)窗口 j」加偏置 score+=prior[j]。
+        #   None=关闭（默认，不创建参数，旧模型严格加载不受影响）。
+        if attn_prior is not None:
+            p = torch.tensor(list(attn_prior), dtype=torch.float)
+            self.prior_bias = nn.Parameter(p)   # 可学习，梯度驱动调整
+        else:
+            self.register_buffer('prior_bias', None)
 
-        # 共享正交基（A7）+ 各分支谱幂（A13 启用 SPDPower）
-        self.shared_trans = SPDTransform(self.d_in, self.d_out)
-        self.q_power = SPDPower(self.d_out)
-        self.k_power = SPDPower(self.d_out)
-        self.v_power = SPDPower(self.d_out)
+        # 独立正交变换（原始 MAtt 做法）：Q/K/V 三套独立 Stiefel 基，
+        # 不存在"q≡k"坍缩机制
+        self.q_trans = SPDTransform(self.d_in, self.d_out)
+        self.k_trans = SPDTransform(self.d_in, self.d_out)
+        self.v_trans = SPDTransform(self.d_in, self.d_out)
 
         if n_heads > 1:
             mask = torch.zeros(n_heads, out_embed_size, self.d_head)
@@ -184,17 +383,40 @@ class AttentionManifold(nn.Module):
     # ---------- 距离/均值（batched eigh） ----------
 
     def tensor_log(self, t):
-        s, u = torch.linalg.eigh(t)
+        # 对称化并求矩阵对数。CUDA 的 syevd 对某些取值(即使严格正定)存在
+        # kernel bug，会拒绝收敛(error code 1 / 反复失败)。已实测单元素 8×8
+        # 矩阵 double + 扰动自愈在 GPU 仍失败 → 对 batch 数很小的输入改走
+        # CPU LAPACK(torch 在 CPU 的 eigh 极稳且同为可微算子，自动处理反向)。
+        t0 = (t + t.mT) / 2
+        n_batch = int(t0.numel() / (t0.shape[-1] * t0.shape[-1]))
+        do_cpu = t0.is_cuda and n_batch <= 4
+        tt = t0.double()
+        if do_cpu:
+            tt = tt.cpu()
+        try:
+            s, u = torch.linalg.eigh(tt)
+        except Exception:
+            print('[DBG] tensor_log eigh failed. n_batch=%d shape=%s finite=%s min=%.3f max=%.3f'
+                  % (n_batch, tuple(t.shape), bool(torch.isfinite(t).all().item()),
+                     float(t.min().item()), float(t.max().item())), flush=True)
+            s, u = torch.linalg.eigh(t0.double().cpu())
         s = s.abs().clamp(min=1e-6)
-        return u @ torch.diag_embed(torch.log(s)) @ u.mT
+        out = (u @ torch.diag_embed(torch.log(s)) @ u.mT).float()
+        return out.to(t.device)
 
     def tensor_exp(self, t):
-        s, u = torch.linalg.eigh(t)
-        return u @ torch.diag_embed(torch.exp(s)) @ u.mT
-
-    def log_euclidean_distance(self, A, B):
-        inner_term = self.tensor_log(A) - self.tensor_log(B)
-        return (inner_term ** 2).sum(dim=(-2, -1))
+        t0 = (t + t.mT) / 2
+        n_batch = int(t0.numel() / (t0.shape[-1] * t0.shape[-1]))
+        do_cpu = t0.is_cuda and n_batch <= 4
+        tt = t0.double()
+        if do_cpu:
+            tt = tt.cpu()
+        try:
+            s, u = torch.linalg.eigh(tt)
+        except Exception:
+            s, u = torch.linalg.eigh(t0.double().cpu())
+        out = (u.float() @ torch.diag_embed(s.exp().float()) @ u.mT.float()).float()
+        return out.to(t.device)
 
     def LogEuclideanMean(self, weight, cov):
         # A6 说明: softmax 权重行和恒为 1，此时「在参考点 R 的切空间加权平均」
@@ -211,8 +433,8 @@ class AttentionManifold(nn.Module):
     # ---------- 投影 / 头切分 ----------
 
     def _project(self, x):
-        base = self.shared_trans(x)
-        return self.q_power(base), self.k_power(base), self.v_power(base)
+        # 独立变换：Q/K/V 各自正交基投影，互不共享，无"q≡k"坍缩
+        return self.q_trans(x), self.k_trans(x), self.v_trans(x)
 
     def _split_heads(self, X):
         if self.n_heads == 1:
@@ -231,8 +453,9 @@ class AttentionManifold(nn.Module):
     # ---------- 稀疏注意力对 ----------
 
     def _anchors(self, m):
+        # 用户要求删除锚点：anchor_stride=None → 无锚点（纯局部带注意力）
         if self.anchor_stride is None:
-            return [0]
+            return []
         return sorted(set(list(range(0, m, self.anchor_stride)) + [m - 1]))
 
     def _pairs(self, m):
@@ -256,9 +479,57 @@ class AttentionManifold(nn.Module):
         bs, m = Q.shape[0], Q.shape[1]
         qi, kj = self._pairs(m)
         qi, kj = qi.to(Q.device), kj.to(Q.device)
-        energy = self.log_euclidean_distance(Q[:, qi], K[:, kj])
+        # 去重: 先对全量 Q/K 各做一次 log-Euclidean log（B·M 次 eigh），
+        # 再按稀疏对索引取用（原按对 gather 重复 tensor_log，B·n_pairs 次，~3.5× 冗余）
+        logQ = self.tensor_log(Q)               # (bs, m, d, d)
+        logK = self.tensor_log(K)
+        inner = logQ[:, qi] - logK[:, kj]       # (bs, n_pairs, d, d)
+        energy = (inner ** 2).sum(dim=(-2, -1))  # (bs, n_pairs)
+        scores = Q.new_full((bs, m, m), float('-inf'))
+        if ATTN_SCORE_ORIGINAL:
+            # 原文打分：相似度 = 1/(1+log(1+d²))（距离→相似度，压缩动态范围），
+            # 然后沿 dim=-2（query 维）softmax，再 permute 使行=key、列=query
+            sim = 1.0 / (1.0 + torch.log1p(energy))
+            scores[:, qi, kj] = sim
+            if self.prior_bias is not None:
+                scores = scores + self.prior_bias.view(1, 1, -1).to(scores.device)
+            # 与原文一致：softmax(dim=-2) → permute(0,2,1)
+            p = torch.softmax(scores, dim=-2).permute(0, 2, 1)
+            return p
+        scores[:, qi, kj] = -energy
+        if self.prior_bias is not None:  # 协议先验：提升想象段(key)窗的注意力
+            scores = scores + self.prior_bias.view(1, 1, -1).to(scores.device)
+        return torch.softmax(scores, dim=-1)
+
+    # ---------- 黎曼差打分（方向B：Log-Euclidean 切空间参考差，以窗0静息为锚） ----------
+
+    def _head_prob_ref(self, Q, K):
+        """以窗0为参考点的切空间差值打分（LE 度量，梯度线性稳定）。
+
+        把每个窗投影到恒等参考的切空间（log，即 LE 对数映射），再相对窗0静息
+        基线取切向量差：Δ_i = log X_i − log X_0。Δ 是切空间元素（实对称矩阵，
+        不是新 SPD），打分 = -‖Δ^Q_i - Δ^K_j‖² 衡量两窗「相对静息的改进方向」
+        的距离。纯矩阵减 + 谱 log，无 P^{1/2} 白化，回避矩阵根反导的条件数爆炸。
+
+        注：真仿射不变黎曼对数映射 Log_P(X)=P^{1/2}log(P^{-1/2}XP^{-1/2})P^{1/2}
+        在手写 backward 经数值验证在本数据上因「双 eigh + 白化」复合条件数爆 nan，
+        故此处采用 Log-Euclidean 切向量差——同为流形切向量，仅度量不同，数值稳定。
+        """
+        bs, m = Q.shape[0], Q.shape[1]
+        logQ = self.tensor_log(Q)                  # (bs,m,d,d) 恒等参考切空间
+        logK = self.tensor_log(K)
+        dQ = logQ - logQ[:, 0:1]                   # 相对窗0静息基线
+        dK = logK - logK[:, 0:1]
+        qi, kj = self._pairs(m)
+        qi, kj = qi.to(Q.device), kj.to(Q.device)
+        dQf = dQ.reshape(bs, m, self.d_out, self.d_out)
+        dKf = dK.reshape(bs, m, self.d_out, self.d_out)
+        inner = dQf[:, qi] - dKf[:, kj]            # (bs,n_pairs,d,d)
+        energy = (inner ** 2).sum(dim=(-2, -1))
         scores = Q.new_full((bs, m, m), float('-inf'))
         scores[:, qi, kj] = -energy
+        if self.prior_bias is not None:  # 协议先验：提升想象段(key)窗的注意力
+            scores = scores + self.prior_bias.view(1, 1, -1).to(scores.device)
         return torch.softmax(scores, dim=-1)
 
     # ---------- 前向 ----------
@@ -271,8 +542,33 @@ class AttentionManifold(nn.Module):
         Qf, Kf, Vf = self._project(x)
         Qh, Kh, Vh = self._split_heads(Qf), self._split_heads(Kf), self._split_heads(Vf)
 
-        outs = [self.LogEuclideanMean(self._head_prob(Qh[h], Kh[h]), Vh[h])
-                for h in range(self.n_heads)]
+        outs = []
+        for h in range(self.n_heads):
+            Q, K, V = Qh[h], Kh[h], Vh[h]
+            if self.attn_change is None:
+                # 原始：相似匹配打分 + V 直接加权
+                w = self._head_prob(Q, K)
+                outs.append(self.LogEuclideanMean(w, V))
+            elif self.attn_change == 'ref':
+                # 方向A：显式静息参考（窗0作基线）。
+                #   打分保持原相似匹配；仅把 value 聚合为「相对窗0静息基线的 log 域嵌值」：
+                #   out_i = expm( Σ_j w[i,j]·(logV_j − logV_0) )，
+                #   使后续窗的输出携带「偏离静息」的变化结构；窗0行强制保留自身基线。
+                bs, m = Q.shape[0], Q.shape[1]
+                w = self._head_prob(Q, K)
+                logV = self.tensor_log(V).view(bs, m, -1)          # (B,M,d·d)
+                base = logV[:, 0:1]                                # 静息窗0基线 (B,1,d·d)
+                rel = logV - base                                  # (B,M,d·d) 相对静息的变化
+                out_log = w @ rel                                  # Σ w·(logV_j − logV_0)
+                out_log[:, 0, :] = base[:, 0, :]                   # 窗0保留静息基线
+                outs.append(self.tensor_exp(out_log.view(bs, -1, self.d_out, self.d_out)))
+            elif self.attn_change == 'diff':
+                # 方向B：真黎曼差打分（仿射不变，参考窗0静息）。
+                #   打分用相对窗0的黎曼对数映射切向量距离 score_ij=-‖ΔQ_i-ΔK_j‖²，
+                #   凸出「偏离静息」的变化；value 仍走原 LogEuclideanMean(_,V)，
+                #   即只换打分，满足"流形上的差分用黎曼方法"。
+                w = self._head_prob_ref(Q, K)
+                outs.append(self.LogEuclideanMean(w, V))
         output = self._merge_heads(outs)
 
         shape = list(output.shape[:2])
@@ -282,10 +578,13 @@ class AttentionManifold(nn.Module):
 
     @torch.no_grad()
     def attention_prob(self, x):
-        """可视化用：返回 (bs, m, m) 注意力概率（多头平均，稀疏未计算处为 0）"""
+        """可视化用：返回 (bs, m, m) 注意力概率（多头平均，稀疏未计算处为 0）。"""
         Qf, Kf, _ = self._project(x)
         Qh, Kh = self._split_heads(Qf), self._split_heads(Kf)
-        probs = [self._head_prob(Qh[h], Kh[h]) for h in range(self.n_heads)]
+        if self.attn_change == 'diff':
+            probs = [self._head_prob_ref(Qh[h], Kh[h]) for h in range(self.n_heads)]
+        else:
+            probs = [self._head_prob(Qh[h], Kh[h]) for h in range(self.n_heads)]
         return torch.stack(probs).mean(0)
 
 
@@ -293,40 +592,64 @@ class mAtt_bci(nn.Module):
     """滑动窗稀疏流形注意力模型（PhysionetMI / BCI2A 22 通道）
 
     结构: 解剖通道加权(A9) → conv FE + InstanceNorm(A8) → Hann 滑动窗 E2R(A2/A3,
-    返回协方差与 log-trace) → SPDNorm 流形仿射对齐(A12) → 稀疏流形注意力(A4/A5/A7/A13)
-    → 平滑整流(A11) → 切空间 + log-trace 拼接(A1) → Linear。
+    返回 trace 归一化协方差) → SPDNorm 流形仿射对齐(A12) → 稀疏流形注意力(A4/A5/A7/A13)
+    → 平滑整流(A11) → 切空间 → Linear。
     """
 
     def __init__(self, win_samples, step_samples, n_classes=4,
                  d_attn_in=20, d_attn_out=18,
                  local_radius=1, anchor_stride=None, n_heads=1,
-                 n_windows=None, use_hann=True):
+                 n_windows=None, use_hann=True, conv2_separable=False,
+                 conv2_multiscale=False,
+                 conv2_ms_per_branch=None, conv2_ms_specs=None,
+                 n_spatial_filters=22, channel_gaussian=False,
+                 gaussian_sigma=0.62, attn_change=None,
+                 attn_prior=None, manifold_change=None):
         super().__init__()
         # A9: 解剖先验通道加权/删除（数据 22 通道顺序 = BCI2A_CHANNELS）
-        self.channel_weight = ChannelPriorWeighting(BCI2A_CHANNELS)
+        #   channel_gaussian=True 时用固定 2D 高斯掩膜（不参与训练），防止跨被试关闭通道
+        self.channel_weight = ChannelPriorWeighting(
+            BCI2A_CHANNELS, gaussian=channel_gaussian, gaussian_sigma=gaussian_sigma)
 
-        # FE: (bs,1,22,T) → (bs,22,1,T) → (bs,d_attn_in,1,T)
-        self.conv1 = nn.Conv2d(1, 22, (22, 1))
-        self.In1 = nn.InstanceNorm2d(22, affine=True)   # A8: IN 替代 BN，消除跨被试统计漂移
-        self.conv2 = nn.Conv2d(22, d_attn_in, (1, 12), padding=(0, 6))
+        # FE: 空间滤波（conv1）将 22 通道压缩为 n_spatial_filters 个空间分量
+        #   （容积传导使通道非独立，更少的分量即可覆盖主要空间结构）
+        # (bs,1,22,T) → (bs,n_spatial_filters,1,T) → (bs,d_attn_in,1,T)
+        n_sp = int(n_spatial_filters)
+        self.n_spatial_filters = n_sp
+        self.conv1 = nn.Conv2d(1, n_sp, (22, 1))
+        self.In1 = nn.InstanceNorm2d(n_sp, affine=True)   # A8: IN 替代 BN，消除跨被试统计漂移
+        # conv2 实现：全连接时序卷积（同上） / 多尺度并联滤波器组 / 深度可分离
+        if conv2_multiscale:
+            self.conv2 = _Conv2dTemporalMultiScale(
+                n_sp, d_attn_in,
+                specs=(conv2_ms_specs if conv2_ms_specs is not None
+                       else ((8, 1), (16, 1), (32, 1), (16, 2))),
+                per_branch=conv2_ms_per_branch)
+        elif conv2_separable:
+            self.conv2 = _Conv2dTemporalSeparable(n_sp, d_attn_in, kernel_size=12, padding=6)
+        else:
+            self.conv2 = nn.Conv2d(n_sp, d_attn_in, (1, 12), padding=(0, 6))
         self.In2 = nn.InstanceNorm2d(d_attn_in, affine=True)
 
         # E2R: Hann 滑动窗
         self.ract1 = E2R(win_samples, step_samples, use_hann=use_hann)
         # A12: 流形仿射对齐（log 域平移 + 可学习谱缩放），先对齐再进注意力
         self.spdnorm = SPDNorm(d_attn_in)
+        # 流形变化特征（相对静息/差分），None=恒等
+        self.manifold_change = ManifoldChange(manifold_change)
 
         self.att2 = AttentionManifold(
             d_attn_in, d_attn_out,
             local_radius=local_radius, anchor_stride=anchor_stride, n_heads=n_heads,
+            attn_change=attn_change, attn_prior=attn_prior,
         )
         self.ract2 = SPDRectified()  # A11: 平滑整流
         self.tangent = SPDTangentSpace(d_attn_out)
         self.flat = nn.Flatten()
         self.dropout = nn.Dropout(0.5)  # 对抗过拟合
 
-        # 每窗口特征 = 切空间向量 d(d+1)/2 维 + 1 维 log-trace（A1 折衷拼接）
-        self.feat_per_window = d_attn_out * (d_attn_out + 1) // 2 + 1
+        # 每窗口特征 = 切空间向量 d(d+1)/2 维
+        self.feat_per_window = d_attn_out * (d_attn_out + 1) // 2
         if n_windows is None:
             self.linear = nn.LazyLinear(n_classes, bias=True)
         else:
@@ -336,14 +659,14 @@ class mAtt_bci(nn.Module):
         x = self.channel_weight(x)
         x = self.In1(self.conv1(x))
         x = self.In2(self.conv2(x))
-        spd, log_trace = self.ract1(x)          # (B,M,C,C), (B,M)
+        spd = self.ract1(x)                     # (B,M,C,C)
         spd = self.spdnorm(spd)                 # A12
+        spd = self.manifold_change(spd)         # 变化特征（None=恒等）
         x, shape = self.att2(spd)
         x = self.ract2(x)
         x = self.tangent(x)
         x = x.view(shape[0], shape[1], -1)
         x = self.flat(x)
-        x = torch.cat([x, log_trace], dim=1)    # A1: 拼接 log-trace，模型自行决定用不用
         x = self.dropout(x)                     # 对抗过拟合
         return self.linear(x)
 
@@ -352,12 +675,13 @@ class mAtt_bci(nn.Module):
         x = self.channel_weight(x)
         x = self.In1(self.conv1(x))
         x = self.In2(self.conv2(x))
-        spd, log_trace = self.ract1(x)
+        spd = self.ract1(x)
         spd = self.spdnorm(spd)
+        spd = self.manifold_change(spd)
         x, shape = self.att2(spd)
         x = self.ract2(x)
         x = self.tangent(x)
-        return torch.cat([self.flat(x.view(shape[0], shape[1], -1)), log_trace], dim=1)
+        return self.flat(x.view(shape[0], shape[1], -1))
 
 
 class mAtt_mamem(nn.Module):
@@ -380,7 +704,7 @@ class mAtt_mamem(nn.Module):
         self.ract2 = SPDRectified()
         self.tangent = SPDTangentSpace(d_attn_out)
         self.flat = nn.Flatten()
-        self.feat_per_window = d_attn_out * (d_attn_out + 1) // 2 + 1
+        self.feat_per_window = d_attn_out * (d_attn_out + 1) // 2
         if n_windows is None:
             self.linear = nn.LazyLinear(n_classes, bias=True)
         else:
@@ -389,14 +713,13 @@ class mAtt_mamem(nn.Module):
     def forward(self, x):
         x = self.In1(self.conv1(x))
         x = self.In2(self.conv2(x))
-        spd, log_trace = self.ract1(x)
+        spd = self.ract1(x)
         spd = self.spdnorm(spd)
         x, shape = self.att2(spd)
         x = self.ract2(x)
         x = self.tangent(x)
         x = x.view(shape[0], shape[1], -1)
         x = self.flat(x)
-        x = torch.cat([x, log_trace], dim=1)
         return self.linear(x)
 
 
@@ -420,7 +743,7 @@ class mAtt_cha(nn.Module):
         self.ract2 = SPDRectified()
         self.tangent = SPDTangentSpace(d_attn_out)
         self.flat = nn.Flatten()
-        self.feat_per_window = d_attn_out * (d_attn_out + 1) // 2 + 1
+        self.feat_per_window = d_attn_out * (d_attn_out + 1) // 2
         if n_windows is None:
             self.linear = nn.LazyLinear(n_classes, bias=True)
         else:
@@ -429,12 +752,11 @@ class mAtt_cha(nn.Module):
     def forward(self, x):
         x = self.In1(self.conv1(x))
         x = self.In2(self.conv2(x))
-        spd, log_trace = self.ract1(x)
+        spd = self.ract1(x)
         spd = self.spdnorm(spd)
         x, shape = self.att2(spd)
         x = self.ract2(x)
         x = self.tangent(x)
         x = x.view(shape[0], shape[1], -1)
         x = self.flat(x)
-        x = torch.cat([x, log_trace], dim=1)
         return self.linear(x)

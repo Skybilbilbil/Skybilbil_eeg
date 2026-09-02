@@ -4,8 +4,7 @@ S03/S09 被试内 vs 9人混合跨被试 · 细化算法过程分析
 ====================================================
 针对指定被试对（默认 S03、S09）:
   - 完整保存该被试在「被试内模型」与「9人混合跨被试模型」下的逐层算法过程数据
-    （每层原始特征张量、逐窗口 log-trace/协方差能量/切空间范数、注意力概率矩阵、
-     预测与标签）到 pkl，便于后续任意复现/再分析；
+    （每层原始特征张量、逐窗口协方差能量/切空间范数、注意力概率矩阵、预测与标签）
   - 输出细化分析: 逐层分布对比 / 逐窗口轨迹 / 注意力结构 / 切空间PCA /
      逐类逐层偏移 / 混淆矩阵。
 """
@@ -31,12 +30,12 @@ BS = 16
 N_CLASSES = 4
 D_ATTN_IN, D_ATTN_OUT = 8, 8
 
-CKPT_PATTERN_W = 'profile10_repeat1_sub{sid}_epochs4_lr0.0005_wd0.5_best_loss.pt'
-CKPT_CROSS = OUT_DIR / 'profile10_cross_repeat1_sub0_epochs4_lr0.0005_wd0.5_best_loss.pt'
+CKPT_PATTERN_W = 'trainpair_within_S{sid}_best_loss.pt'
+CKPT_CROSS = OUT_DIR / 'trainpair_cross_mix_best_loss.pt'
 DATA_PATH = str(BASE.parent / 'saved_data' / 'preprocessed_data_bci2a_raw_ica.pkl')
 
 # 画箱线图选用的关键层
-BOX_LAYERS = ['channel_weight', 'conv1', 'conv2', 'ract1.signal2spd[1]',
+BOX_LAYERS = ['channel_weight', 'conv1', 'conv2',
               'spdnorm', 'tangent.vec', 'dropout', 'linear']
 
 
@@ -162,27 +161,20 @@ def analyze(process):
             m = pair_metrics(vecs_w, vecs_c, kind, spdW, spdC)
             sub['layers'][name] = m
 
-        # ---- 逐窗口: log-trace / 协方差能量 / 切空间范数 ----
-        lt_w = rw['raw']['ract1.signal2spd[1]']  # (n, M)
-        lt_c = rc['raw']['ract1.signal2spd[1]']
-        cov_w = rw['raw']['ract1.signal2spd[0]']  # (n, M, 8, 8)
-        cov_c = rc['raw']['ract1.signal2spd[0]']
-        tan_w = rw['raw']['tangent.vec'].reshape(len(lt_w), M, -1)
-        tan_c = rc['raw']['tangent.vec'].reshape(len(lt_c), M, -1)
-        win = {'log_trace_ratio': [], 'cov_ratio': [], 'tan_ratio': [],
-               'log_trace_within': [], 'log_trace_cross': [],
+        # ---- 逐窗口: 协方差能量 / 切空间范数 ----
+        cov_w = rw['raw']['ract1.signal2spd']  # (n, M, 8, 8)
+        cov_c = rc['raw']['ract1.signal2spd']
+        tan_w = rw['raw']['tangent.vec'].reshape(len(cov_w), M, -1)
+        tan_c = rc['raw']['tangent.vec'].reshape(len(cov_c), M, -1)
+        win = {'cov_ratio': [], 'tan_ratio': [],
                'cov_within': [], 'cov_cross': []}
         for w in range(M):
-            mlw, mlc = lt_w[:, w].mean(), lt_c[:, w].mean()
             mco = (np.linalg.norm(cov_w[:, w], axis=(1, 2)).mean(),
                    np.linalg.norm(cov_c[:, w], axis=(1, 2)).mean())
             mtn = (np.linalg.norm(tan_w[:, w], axis=1).mean(),
                    np.linalg.norm(tan_c[:, w], axis=1).mean())
-            win['log_trace_ratio'].append(abs(mlc - mlw) / (abs(mlw) + 1e-8))
             win['cov_ratio'].append(abs(mco[1] - mco[0]) / (mco[0] + 1e-8))
             win['tan_ratio'].append(abs(mtn[1] - mtn[0]) / (mtn[0] + 1e-8))
-            win['log_trace_within'].append(float(mlw))
-            win['log_trace_cross'].append(float(mlc))
             win['cov_within'].append(float(mco[0]))
             win['cov_cross'].append(float(mco[1]))
         sub['windows'] = win
@@ -254,10 +246,10 @@ def format_report(report):
                          f'{m["mmd"]:<9.4f}{m["std_ratio"]:<9.3f}{g:<8s}')
         win = sub['windows']
         lines.append('\n[逐窗口差异] (窗口1=试次起始 0ms, 每窗口 500ms 步长)')
-        lines.append(f'{"窗口":<6s}{"log-trace within":<17s}{"log-trace cross":<17s}{"LT比值":<9s}{"协方差比值":<10s}{"切空间比值":<10s}')
-        for w in range(len(win['log_trace_ratio'])):
-            lines.append(f'  w{w+1}   {win["log_trace_within"][w]:+.4f}        {win["log_trace_cross"][w]:+.4f}        '
-                         f'{win["log_trace_ratio"][w]:.3f}      {win["cov_ratio"][w]:.3f}       {win["tan_ratio"][w]:.3f}')
+        lines.append(f'{"窗口":<6s}{"协方差 within":<14s}{"协方差 cross":<14s}{"协方差比值":<10s}{"切空间比值":<10s}')
+        for w in range(len(win['cov_ratio'])):
+            lines.append(f'  w{w+1}   {win["cov_within"][w]:.4f}          {win["cov_cross"][w]:.4f}          '
+                         f'{win["cov_ratio"][w]:.3f}        {win["tan_ratio"][w]:.3f}')
         att = sub['attention']
         lines.append(f'\n[注意力结构] 对角线集中度: within={att["diag_concentration_within"]:.3f} '
                      f'cross={att["diag_concentration_cross"]:.3f}  两矩阵Frobenius距离={att["frobenius_dist"]:.3f}')

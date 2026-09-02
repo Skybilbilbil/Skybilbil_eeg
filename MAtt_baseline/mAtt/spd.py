@@ -118,52 +118,42 @@ class SPDUnVectorize(nn.Module):
 
 
 class SPDTangentSpaceFunction(Function):
+    """矩阵对数（切空间映射）: X → U log(λ) U^T（batched，无 Python 循环）
+
+    原实现逐元素 Python 循环 eigh（B·M 次 kernel 启动，CPU 墙钟大头），
+    现改为 torch.linalg.eigh 整批处理，数学恒等；
+    backward 复用 forward 保存的特征分解 (|λ|, U)，省去重复 eigh。
+    """
 
     @staticmethod
     def forward(ctx, input):
-        ctx.save_for_backward(input)
-        
-        output = input.new(input.size(0), input.size(1), input.size(2))
-        for k, x in enumerate(input):
-            s, u = torch.linalg.eigh(x)
-            s = s.abs()
-            s.log_()
-            output[k] = u @ (torch.diag(s) @ u.T)
-
-        return output
+        s, u = torch.linalg.eigh(input)
+        s_abs = s.abs()
+        ctx.save_for_backward(s_abs, u)
+        return u @ torch.diag_embed(s_abs.log()) @ u.transpose(-1, -2)
 
     @staticmethod
     def backward(ctx, grad_output):
-        input = ctx.saved_tensors
-        input = input[0]
+        s_abs, u = ctx.saved_tensors
         grad_input = None
 
         if ctx.needs_input_grad[0]:
-            eye = input.new(input.size(1))
-            eye.fill_(1)
-            eye = torch.diag(eye)
-            grad_input = input.new(input.size(0), input.size(1), input.size(1))
-            for k, g in enumerate(grad_output):
-                x = input[k]
-                s, u = torch.linalg.eigh(x)
-                s = s.abs()
-                
-                g = symmetric(g)
-                
-                s_log_diag = torch.diag(s.log())
-                s_inv_diag = torch.diag(1 / s)
-                
-                dLdV = 2 * (g @ (u @ s_log_diag))
-                dLdS = eye * (s_inv_diag @ (u.T @ (g @ u)))
-                
-                P = s.unsqueeze(1)
-                P = P.expand(-1, P.size(0))
-                P = P - P.t()
-                mask_zero = torch.abs(P) == 0
-                P = 1 / P
-                P[mask_zero] = 0
-                
-                grad_input[k] = u @ (symmetric(P.T * (u.T @ dLdV)) + dLdS) @ u.T
+            s = s_abs
+
+            g = symmetric(grad_output)
+
+            log_s = s.log()
+            s_inv = 1.0 / s
+
+            dLdV = 2.0 * (g @ (u * log_s.unsqueeze(-2)))     # g @ (u @ diag(log s))
+            diagGu = (u.transpose(-1, -2) @ (g @ u)).diagonal(dim1=-2, dim2=-1)
+            dLdS_vec = s_inv * diagGu                        # eye·(diag(1/s) @ (U^T g U))
+
+            P = _safe_diff_matrix(s)
+            grad_input = u @ (
+                symmetric(P.transpose(-1, -2) * (u.transpose(-1, -2) @ dLdV))
+                + torch.diag_embed(dLdS_vec)
+            ) @ u.transpose(-1, -2)
 
         return grad_input
 
@@ -248,8 +238,8 @@ class SPDUnTangentSpace(nn.Module):
         output = SPDUnTangentSpaceFunction.apply(input)
         return output
 
-# TODO: [算法确认] SPDTangentSpaceFunction / SPDUnTangentSpaceFunction 仍为
-# Python 循环遍历 batch 维，可后续 batched 化（eigh 原生支持批量输入）。
+# TODO: [算法确认] SPDUnTangentSpaceFunction（以及 SPDUnVectorizeFunction）未被
+# 模型路径使用（仅 SPDTangentSpace 参与前向）；SPDTangentSpaceFunction 已 batched。
 # SPDRectifiedFunction / SPDPowerFunction 已 batched 重写。
 
 def _safe_diff_matrix(s):
@@ -320,8 +310,9 @@ class SPDPowerFunction(Function):
     """
 
     @staticmethod
-    def forward(ctx, input, weight):
-        s, u = torch.linalg.eigh(input)
+    def forward(ctx, input, weight, s=None, u=None):
+        if s is None or u is None:
+            s, u = torch.linalg.eigh(input)
         s = s.abs().clamp(min=1e-6)
         log_s = s.log()
         s_power = torch.exp(weight * log_s)
@@ -356,7 +347,7 @@ class SPDPowerFunction(Function):
                     + torch.diag_embed(dLdS_vec)
                 ) @ u.transpose(-1, -2)
 
-        return grad_input, grad_weight
+        return grad_input, grad_weight, None, None
 
 
 class SPDPower(nn.Module):
@@ -365,11 +356,16 @@ class SPDPower(nn.Module):
         super(SPDPower, self).__init__()
         self.weight = nn.Parameter(torch.ones(input_dim), requires_grad=True)
 
-    def forward(self, input):
+    def forward(self, input, eig=None):
         # 兼容任意 batch 维度 (..., n, n)
         orig_shape = input.shape
         x3 = input.reshape(-1, orig_shape[-2], orig_shape[-1])
-        output = SPDPowerFunction.apply(x3, self.weight)
+        if eig is None:
+            output = SPDPowerFunction.apply(x3, self.weight)
+        else:
+            # 复用外部已分解的特征值/特征向量（Q/K/V 共享同一 eigh）
+            s, u = eig
+            output = SPDPowerFunction.apply(x3, self.weight, s, u)
         return output.view(orig_shape)
 
 

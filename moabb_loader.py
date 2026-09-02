@@ -21,7 +21,7 @@ import mne
 import numpy as np
 from moabb.datasets import PhysionetMI
 
-from preprocessing import preprocess_physionetmi_raw
+from preprocessing import preprocess_physionetmi_raw, _normalize_ch_name
 
 SFREQ = 160.0
 
@@ -158,7 +158,11 @@ def get_subject_edf_paths(subject: int, verbose: bool = False) -> list[Path]:
 
 
 def _load_run_raw(path: Path) -> mne.io.BaseRaw:
-    """读取单个 run 的 EDF 文件，仅保留 EEG 通道并设置电极坐标。"""
+    """读取单个 run 的 EDF 文件：读入后立即降维到 22 个目标中央区通道。
+
+    直接在单个 run 上 pick 22 通道（而不是 6 个 run 全量 64 通道拼接后再选），
+    读盘后的内存占用与后续滤波/ICA 计算量都按 22/64 比例大幅下降。
+    """
     raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
     # 仅保留 EEG 通道（MNE 会自动提取 annotation，第 65 列不会被保留为数据通道）
     raw.pick_types(eeg=True)
@@ -166,6 +170,11 @@ def _load_run_raw(path: Path) -> mne.io.BaseRaw:
         raw.set_montage("standard_1020", match_case=False, on_missing="warn")
     except Exception:
         pass
+    # 立即降维：只保留 SELECTED_CHANNEL_NAMES 对应的 22 通道（兼容带后缀的 EDF 命名）
+    norm = {_normalize_ch_name(c): c for c in raw.ch_names}
+    keep = [norm[n] for n in map(_normalize_ch_name, SELECTED_CHANNEL_NAMES) if n in norm]
+    if len(keep) == len(SELECTED_CHANNEL_NAMES):
+        raw.pick_channels(keep)
     return raw
 
 
@@ -224,16 +233,21 @@ def load_subject_mi_raw(subject: int) -> mne.io.BaseRaw:
     return raw_all
 
 
-def load_subject_mi_trials(subject_id: int) -> Tuple[np.ndarray, ...]:
+def load_subject_mi_trials(subject_id: int, reject_amp_uv: float = None) -> Tuple[np.ndarray, ...]:
     """
     与 csv_loader.py 接口兼容：加载单个被试的四类 MI 试次。
+
+    参数:
+        subject_id: 被试编号（1~109，排除列表除外）
+        reject_amp_uv: 峰峰值幅度阈值（µV），剔除超幅坏 trial；None=不剔除
 
     返回:
         left, right, feet, hands: 各为 np.ndarray [n_trials, 22, n_times]
         若某类别无试次，返回形状 (0, 22, n_times) 的空数组
     """
     raw = load_subject_mi_raw(subject_id)
-    left_epochs, right_epochs, feet_epochs, hands_epochs = preprocess_physionetmi_raw(raw)
+    left_epochs, right_epochs, feet_epochs, hands_epochs = preprocess_physionetmi_raw(
+        raw, reject_amp_uv=reject_amp_uv)
 
     epochs_map = {
         "left_hand": left_epochs,

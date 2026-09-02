@@ -65,7 +65,13 @@ def _map_bci2a_annotations(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
 
 
 def _process_raw(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
-    raw.pick_types(eeg=True)
+    # 保留 EOG 通道（BCI2a 原始 GDF 含 EOG1/EOG2/EOG3），供后续 ICA
+    # 用真实眼电参考去伪迹（对齐官方 A01-A05 的 EOG 回归清洗）；
+    # 刺激通道（STI）随 stim 类型被 pick_types 排除。
+    raw.pick_types(eeg=True, eog=True)
+    eog_chs = [c for c in raw.ch_names if 'EOG' in c.upper()]
+    if eog_chs:
+        raw.set_channel_types({c: 'eog' for c in eog_chs})
     try:
         raw.set_montage("standard_1020", match_case=False, on_missing="warn")
     except Exception:
