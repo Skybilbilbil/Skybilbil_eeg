@@ -129,8 +129,8 @@ def ica_denoise(raw, threshold=2.5, max_exclude=2, adaptive_threshold=True):
                     detected_components.extend(filtered_indices)
                 else:
                     detected_components.extend(indices)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f'warning: 无法检测 EOG 成分: {e}')
     else:
         # 无 EOG 通道：先尝试用额部 EEG 通道 (Fpz/AFz) 作为"伪 EOG"辅助检测
         pseudo_eog_candidates = [ch for ch in raw_clean.ch_names if ch.upper() in ['FPZ', 'AFZ', 'FP1', 'FP2']]
@@ -142,8 +142,8 @@ def ica_denoise(raw, threshold=2.5, max_exclude=2, adaptive_threshold=True):
                 if indices:
                     detected_components.extend(indices)
                     eog_detection_used = True
-            except Exception:
-                pass
+            except Exception as e:
+                print(f'warning: 无法检测 EOG 成分: {e}')
 
         # 如果伪 EOG 也没检测到，再用统计降级方案
         if not detected_components:

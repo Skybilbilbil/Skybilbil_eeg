@@ -74,8 +74,8 @@ def _process_raw(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
         raw.set_channel_types({c: 'eog' for c in eog_chs})
     try:
         raw.set_montage("standard_1020", match_case=False, on_missing="warn")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'warning: 无法设置 montage: {e}')
     raw = _map_bci2a_annotations(raw)
     return raw
 

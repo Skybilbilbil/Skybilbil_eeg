@@ -306,7 +306,7 @@ def save_visualization_data(net, testloader, history, test_acc, args, criterion=
     all_attn = torch.cat(all_attn, dim=0)
 
     channel_names = BCI2A_CHANNELS if args['dataset'] == 'bci2a' else [f'Ch{i+1}' for i in range(22)]
-    sfreq = 250
+    sfreq = 250 if args['dataset'] == 'bci2a' else 160
 
     np.savez(
         data_path,

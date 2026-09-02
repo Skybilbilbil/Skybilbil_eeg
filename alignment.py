@@ -116,7 +116,7 @@ def riemannian_distance(A, B):
         vals_m, _ = np.linalg.eigh(M)
         vals_m = np.maximum(vals_m, 1e-10)
         return np.sqrt(np.sum(np.log(vals_m)**2))
-    except:
+    except Exception:
         return np.nan
 
 

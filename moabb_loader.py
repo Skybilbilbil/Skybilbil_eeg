@@ -168,8 +168,8 @@ def _load_run_raw(path: Path) -> mne.io.BaseRaw:
     raw.pick_types(eeg=True)
     try:
         raw.set_montage("standard_1020", match_case=False, on_missing="warn")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f'warning: 无法设置 montage: {e}')
     # 立即降维：只保留 SELECTED_CHANNEL_NAMES 对应的 22 通道（兼容带后缀的 EDF 命名）
     norm = {_normalize_ch_name(c): c for c in raw.ch_names}
     keep = [norm[n] for n in map(_normalize_ch_name, SELECTED_CHANNEL_NAMES) if n in norm]
