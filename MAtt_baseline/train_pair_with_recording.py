@@ -15,7 +15,7 @@
 （profile_11 = 恢复全连接 conv2 + 保留 3 处等价优化 + 移除 log_trace 的新基线）
 """
 
-import os, sys, json, time, pickle
+import sys, json, time, pickle
 import numpy as np
 import torch
 import torch.nn as nn
@@ -28,11 +28,10 @@ from mAtt.mAtt import mAtt_bci
 from mAtt.optimizer import MixOptimizer
 from analyze_cross_pipeline import (
     FeatureRecorder, batch_to_vectors, LAYER_ORDER, LAYER_DISP,
-    FS, WIN_SAMPLES, STEP_SAMPLES, DEVICE,
+    WIN_SAMPLES, STEP_SAMPLES, DEVICE,
     load_preprocessed_dataset, split_train_valid_test, le_mean,
 )
 
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Device: {DEVICE}')
 
 # ============ 命令行参数：空间滤波器个数 / 输出目录 ============

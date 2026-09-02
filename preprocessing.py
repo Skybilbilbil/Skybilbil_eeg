@@ -4,10 +4,6 @@ import numpy as np
 import scipy.stats
 
 # 平均参考处理
-def reference(raw):
-    raw_copy = raw.copy()
-    raw_copy.set_eeg_reference(ref_channels='average')
-    return raw_copy
 
 # 滤波处理
 def filter(raw) :
@@ -72,12 +68,6 @@ def select_channels_physionetmi(raw):
 
     return raw_copy
 
-
-def select_channels_auto(raw, preprocessor="physionetmi"):
-    """PhysionetMI 通道选择与预处理。"""
-    if preprocessor == "physionetmi":
-        return select_channels_physionetmi(raw)
-    raise ValueError(f"未支持的预处理管线: {preprocessor}")
 
 def ica_denoise(raw, threshold=2.5, max_exclude=2, adaptive_threshold=True):
     """
@@ -163,11 +153,6 @@ def ica_denoise(raw, threshold=2.5, max_exclude=2, adaptive_threshold=True):
     unique_components = list(dict.fromkeys(detected_components))
     final_exclude = unique_components[:max_exclude]
 
-    if not eog_detection_used and not final_exclude:
-        # 无任何 EOG/伪 EOG 参考，且统计方法也没检出 → 保守处理：跳过 ICA 排除
-        # 因为无参考时盲目排除峰度高的成分可能误删有效脑电信号
-        pass
-    
     metrics = {}
     if final_exclude:
         ica.exclude = final_exclude

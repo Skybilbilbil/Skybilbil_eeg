@@ -286,11 +286,6 @@ def discover_four_class_mi_datasets(verbose: bool = True):
     return [dataset]
 
 
-def get_preprocessor_name(dataset) -> str:
-    """（旧接口）返回数据集对应的预处理管线名称。"""
-    return "physionetmi"
-
-
 def get_dataset_summary(datasets=None) -> list[dict]:
     """（旧接口）返回数据集摘要信息。"""
     return [{

@@ -6,7 +6,6 @@ PhysioNet EEGMMIDB 数据集下载脚本
 
 import warnings
 import time
-import os
 from pathlib import Path
 
 # 忽略警告

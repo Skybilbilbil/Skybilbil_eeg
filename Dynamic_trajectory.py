@@ -3,7 +3,6 @@ import numpy as np
 import torch
 import mne
 from pathlib import Path
-from tqdm import tqdm
 import time
 
 # ========== 配置参数 ==========
@@ -47,10 +46,6 @@ def _select_channels_from_metadata(all_trials, channel_names):
         indices.append(name_to_idx[ch])
 
     return all_trials[:, indices, :]
-
-# 计算样本数（默认 250Hz；若被试 sfreq 不同则在循环内重算窗口）
-WIN_SAMPLES = int(WIN_SEC * DEFAULT_SFREQ)
-STEP_SAMPLES = int(STEP_SEC * DEFAULT_SFREQ)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
