@@ -21,7 +21,7 @@ import mne
 import numpy as np
 from moabb.datasets import PhysionetMI
 
-from preprocessing import preprocess_physionetmi_raw, _normalize_ch_name
+from preprocessing import preprocess_physionetmi_raw, _normalize_ch_name, epochs_to_arrays
 
 SFREQ = 160.0
 
@@ -256,22 +256,11 @@ def load_subject_mi_trials(subject_id: int, reject_amp_uv: float = None) -> Tupl
         "hands": hands_epochs,
     }
 
-    n_times = 0
-    for ep in epochs_map.values():
-        if len(ep) > 0:
-            n_times = ep.get_data(copy=False).shape[-1]
-            break
-
-    result = []
-    for name in ["left_hand", "right_hand", "feet", "hands"]:
-        ep = epochs_map[name]
-        if len(ep) == 0 or n_times == 0:
-            arr = np.empty((0, len(SELECTED_CHANNEL_NAMES), n_times))
-        else:
-            arr = ep.get_data(copy=False).astype(np.float32)
-        result.append(arr)
-
-    return tuple(result)
+    return epochs_to_arrays(
+        epochs_map,
+        ["left_hand", "right_hand", "feet", "hands"],
+        len(SELECTED_CHANNEL_NAMES),
+    )
 
 
 # ---------------------------------------------------------------------------

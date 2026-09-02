@@ -8,15 +8,14 @@ MAtt 跨被试泛化实验入口（滑动时间窗 + 稀疏流形注意力版）
 
 import sys
 import json
-import torch
-import torch.nn as nn
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mAtt.mAtt import mAtt_bci, E2R
+from mAtt.mAtt import E2R
 from utils.functions import (
     trainNetwork, testNetwork, save_visualization_data, resolve_path,
+    build_matt_model, load_matt_model,
 )
 from utils.GetPhysionetMI import getCrossSubjectDataloader
 
@@ -90,20 +89,7 @@ def main():
     print(f'时间长度 T={T} → {n_windows} 个窗口；注意力: local_radius={args["local_radius"]}, '
           f'anchor_stride={args["anchor_stride"]}, n_heads={args["n_heads"]}')
 
-    net = mAtt_bci(
-        win_samples, step_samples,
-        n_classes=args['n_classes'],
-        local_radius=args['local_radius'],
-        anchor_stride=args['anchor_stride'],
-        n_heads=args['n_heads'],
-        n_windows=None,          # LazyLinear 自适应实际窗口数（卷积改变时序长度）
-    )
-    net.dropout = nn.Dropout(args.get('dropout', 0.3))
-    if torch.cuda.is_available():
-        net = net.cuda()
-        print(f'使用 GPU: {torch.cuda.get_device_name(0)}')
-    else:
-        print('未检测到 GPU，使用 CPU')
+    net = build_matt_model(win_samples, step_samples, args)
 
     # 训练时用 seen_test_loader 作为监控（被试内测试）
     print('\n--- 开始训练 ---')
@@ -116,29 +102,15 @@ def main():
         net, trainloader, validloader, seen_test_loader, **train_kwargs
     )
 
-    # ---------- state_dict 加载（A17: 重建模型） ----------
-    def load_model(path):
-        m = mAtt_bci(
-            win_samples, step_samples,
-            n_classes=args['n_classes'],
-            local_radius=args['local_radius'],
-            anchor_stride=args['anchor_stride'],
-            n_heads=args['n_heads'],
-            n_windows=None,
-        )
-        m.dropout = nn.Dropout(args.get('dropout', 0.3))
-        m.load_state_dict(torch.load(path, map_location='cpu'))
-        return m.cuda() if torch.cuda.is_available() else m
-
-    # ---------- best loss 模型 ----------
-    net_loss = load_model(best_loss_path)
+    # ---------- state_dict 加载（A17: 重建模型） | best loss 模型 ----------
+    net_loss = load_matt_model(best_loss_path, win_samples, step_samples, args)
     acc_loss_seen = testNetwork(net_loss, seen_test_loader)
     acc_loss_unseen = testNetwork(net_loss, unseen_test_loader)
     print(f'\n[验证 Loss 最佳模型] seen-subject 测试准确率: {acc_loss_seen*100:.2f}%')
     print(f'[验证 Loss 最佳模型] unseen-subject 跨被试准确率: {acc_loss_unseen*100:.2f}%')
 
     # ---------- best acc 模型 ----------
-    net_acc = load_model(best_acc_path)
+    net_acc = load_matt_model(best_acc_path, win_samples, step_samples, args)
     acc_acc_seen = testNetwork(net_acc, seen_test_loader)
     acc_acc_unseen = testNetwork(net_acc, unseen_test_loader)
     print(f'[验证 Acc 最佳模型] seen-subject 测试准确率: {acc_acc_seen*100:.2f}%')

@@ -3,14 +3,13 @@
 MAtt 在 PhysionetMI 预处理数据上的运行脚本（滑动时间窗 + 稀疏流形注意力版）
 """
 
-import torch
-import torch.nn as nn
 import json
 from pathlib import Path
 
-from mAtt.mAtt import mAtt_bci, E2R
+from mAtt.mAtt import E2R
 from utils.functions import (
     trainNetwork, testNetwork, save_visualization_data, resolve_path,
+    build_matt_model, load_matt_model,
 )
 from utils.GetPhysionetMI import getAllDataloader
 
@@ -94,20 +93,7 @@ def main():
     print(f'时间长度 T={T} → {n_windows} 个窗口；注意力: local_radius={args["local_radius"]}, '
           f'anchor_stride={args["anchor_stride"]}, n_heads={args["n_heads"]}')
 
-    net = mAtt_bci(
-        win_samples, step_samples,
-        n_classes=args['n_classes'],
-        local_radius=args['local_radius'],
-        anchor_stride=args['anchor_stride'],
-        n_heads=args['n_heads'],
-        n_windows=None,          # LazyLinear 自适应实际窗口数（卷积改变时序长度）
-    )
-    net.dropout = nn.Dropout(args.get('dropout', 0.3))
-    if torch.cuda.is_available():
-        net = net.cuda()
-        print(f'使用 GPU: {torch.cuda.get_device_name(0)}')
-    else:
-        print('未检测到 GPU，使用 CPU')
+    net = build_matt_model(win_samples, step_samples, args)
 
     # 训练（新参数不属于 trainNetwork，排除之）
     train_kwargs = {k: v for k, v in args.items()
@@ -121,25 +107,12 @@ def main():
     )
 
     # ---------- 用验证 Loss 最低模型测试（A17: state_dict 加载，重建模型） ----------
-    def load_model(path):
-        m = mAtt_bci(
-            win_samples, step_samples,
-            n_classes=args['n_classes'],
-            local_radius=args['local_radius'],
-            anchor_stride=args['anchor_stride'],
-            n_heads=args['n_heads'],
-            n_windows=None,
-        )
-        m.dropout = nn.Dropout(args.get('dropout', 0.3))
-        m.load_state_dict(torch.load(path, map_location='cpu'))
-        return m.cuda() if torch.cuda.is_available() else m
-
-    net_loss = load_model(best_loss_path)
+    net_loss = load_matt_model(best_loss_path, win_samples, step_samples, args)
     acc_loss = testNetwork(net_loss, testloader)
     print(f'\n[验证 Loss 最佳模型] 测试准确率: {acc_loss*100:.2f}%')
 
     # ---------- 用验证准确率最高模型测试 ----------
-    net_acc = load_model(best_acc_path)
+    net_acc = load_matt_model(best_acc_path, win_samples, step_samples, args)
     acc_acc = testNetwork(net_acc, testloader)
     print(f'[验证 Acc 最佳模型] 测试准确率: {acc_acc*100:.2f}%')
 

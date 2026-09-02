@@ -4,6 +4,7 @@ import sys
 import os
 sys.path.append("..")
 from mAtt.optimizer import MixOptimizer
+from mAtt.mAtt import mAtt_bci
 from sklearn.metrics import roc_auc_score as ras, silhouette_score
 import numpy as np
 
@@ -334,5 +335,44 @@ def save_visualization_data(net, testloader, history, test_acc, args, criterion=
         title_suffix=title_suffix
     )
     print(f'可视化数据已保存: {data_path}')
+
+
+# ============================================================
+# 模型构建 & checkpoint 加载
+# （从 run_matt_physionetmi.py / run_matt_cross_subject.py 提取的公共块）
+# ============================================================
+
+
+def build_matt_model(win_samples, step_samples, args):
+    """构建 mAtt_bci 滑动窗稀疏流形注意力模型。
+
+    与原始脚本逐字一致: LazyLinear 用 n_windows=None 自适应，构建后按 args 的
+    dropout 概率替换 self.dropout，并按 GPU 可用性决定模型所在设备。
+    """
+    net = mAtt_bci(
+        win_samples, step_samples,
+        n_classes=args['n_classes'],
+        local_radius=args['local_radius'],
+        anchor_stride=args['anchor_stride'],
+        n_heads=args['n_heads'],
+        n_windows=None,          # LazyLinear 自适应实际窗口数（卷积改变时序长度）
+    )
+    net.dropout = nn.Dropout(args.get('dropout', 0.3))
+    if torch.cuda.is_available():
+        net = net.cuda()
+        print(f'使用 GPU: {torch.cuda.get_device_name(0)}')
+    else:
+        print('未检测到 GPU，使用 CPU')
+    return net
+
+
+def load_matt_model(path, win_samples, step_samples, args):
+    """重建 mAtt_bci 并加载 checkpoint 的 state_dict（A17: state_dict 加载）。
+
+    权重从 CPU 载入（map_location='cpu'），模型最终落在 GPU（若可用）。
+    """
+    m = build_matt_model(win_samples, step_samples, args)
+    m.load_state_dict(torch.load(path, map_location='cpu'))
+    return m.cuda() if torch.cuda.is_available() else m
 
 

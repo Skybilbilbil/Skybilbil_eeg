@@ -21,7 +21,7 @@ except ImportError:
     except ImportError:
         from moabb.datasets.bnci import BNCI2014001 as _BNCICls
 
-from preprocessing import preprocess_bci2a_raw
+from preprocessing import preprocess_bci2a_raw, epochs_to_arrays
 
 SFREQ = 250.0
 VALID_SUBJECTS = list(range(1, 10))
@@ -107,21 +107,11 @@ def load_subject_mi_trials(subject_id: int) -> Tuple[np.ndarray, ...]:
         "feet": feet,
         "tongue": tongue,
     }
-    n_times = 0
-    for ep in epochs_map.values():
-        if len(ep) > 0:
-            n_times = ep.get_data(copy=False).shape[-1]
-            break
-
-    result = []
-    for name in ["left_hand", "right_hand", "feet", "tongue"]:
-        ep = epochs_map[name]
-        if len(ep) == 0 or n_times == 0:
-            arr = np.empty((0, len(SELECTED_CHANNEL_NAMES), n_times))
-        else:
-            arr = ep.get_data(copy=False).astype(np.float32)
-        result.append(arr)
-    return tuple(result)
+    return epochs_to_arrays(
+        epochs_map,
+        ["left_hand", "right_hand", "feet", "tongue"],
+        len(SELECTED_CHANNEL_NAMES),
+    )
 
 
 if __name__ == "__main__":

@@ -342,6 +342,30 @@ def epochs(raw, tmin=-1.0, tmax=5.0, event_config=None, reject_amp_uv=None):
     return left_epochs, right_epochs, feet_epochs, hands_epochs
 
 
+def epochs_to_arrays(epochs_map, class_names, n_channels):
+    """把按类别名索引的 epochs 字典转成 (n_trials, n_channels, n_times) 数组元组。
+
+    共享逻辑: 先用第一个非空类别探出采样点数 n_times；空类别或无数据类别
+    返回形状 (0, n_channels, n_times) 的空数组；非空数组转 float32。
+    """
+    n_times = 0
+    for ep in epochs_map.values():
+        if len(ep) > 0:
+            n_times = ep.get_data(copy=False).shape[-1]
+            break
+
+    result = []
+    for name in class_names:
+        ep = epochs_map[name]
+        if len(ep) == 0 or n_times == 0:
+            arr = np.empty((0, n_channels, n_times))
+        else:
+            arr = ep.get_data(copy=False).astype(np.float32)
+        result.append(arr)
+
+    return tuple(result)
+
+
 def preprocess_physionetmi_raw(raw, tmin=-1.0, tmax=3.5, reject_amp_uv=None):
     """
     PhysionetMI 原始 EDF 数据完整预处理管线。
