@@ -139,9 +139,8 @@ def load_data():
         splits[sid] = (X_tr, y_tr, X_va, y_va, X_te, y_te)
     X_all = np.concatenate([subject_data[s - 1][0] for s in range(1, 10)], axis=0)
     y_all = np.concatenate([subject_data[s - 1][1] for s in range(1, 10)], axis=0)
-    _, _, _, _, X9_te, y9_te = split_train_valid_test(X_all, y_all)
     # 混合训练/验证（9人全部数据 0.6/0.2/0.2，train 用前两者）
-    X9_tr, y9_tr, X9_va, y9_va, _, _ = split_train_valid_test(X_all, y_all)
+    X9_tr, y9_tr, X9_va, y9_va, X9_te, y9_te = split_train_valid_test(X_all, y_all)
     return subject_data, T, M, splits, (X9_tr, y9_tr, X9_va, y9_va, X9_te, y9_te)
 
 

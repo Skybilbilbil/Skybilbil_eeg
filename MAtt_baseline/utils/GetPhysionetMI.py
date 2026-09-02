@@ -71,6 +71,21 @@ def split_train_valid_test(X, y, train_ratio=0.6, valid_ratio=0.2, random_state=
     return X_train, y_train, X_valid, y_valid, X_test, y_test
 
 
+def _load_subject(sub, subject_data, sample_ratio, random_state):
+    """取出单个被试 (X, y)，校验通道数，并按需做分层采样。"""
+    X, y = subject_data[sub - 1]
+    if X.shape[1] != 22:
+        raise ValueError(f'被试 {sub:03d} 通道数为 {X.shape[1]}，期望 22')
+
+    # 如果指定 sample_ratio < 1.0，先做分层采样
+    if sample_ratio < 1.0:
+        _, X, _, y = train_test_split(
+            X, y, test_size=sample_ratio, stratify=y, random_state=random_state
+        )
+
+    return X, y
+
+
 def getCrossSubjectDataloader(seen_subjects, unseen_subjects, data_path,
                               bs=16, epochs=4, dataset='physionetmi',
                               seen_test_ratio=0.2, valid_ratio=0.2,
@@ -104,16 +119,7 @@ def getCrossSubjectDataloader(seen_subjects, unseen_subjects, data_path,
     # 收集 seen subjects：先全部合并，再统一划分 train/valid/seen_test
     X_seen_all, y_seen_all = [], []
     for sub in seen_subjects:
-        X, y = subject_data[sub - 1]
-        if X.shape[1] != 22:
-            raise ValueError(f'被试 {sub:03d} 通道数为 {X.shape[1]}，期望 22')
-
-        # 如果指定 sample_ratio < 1.0，先做分层采样
-        if sample_ratio < 1.0:
-            _, X, _, y = train_test_split(
-                X, y, test_size=sample_ratio, stratify=y, random_state=random_state
-            )
-
+        X, y = _load_subject(sub, subject_data, sample_ratio, random_state)
         X_seen_all.append(X); y_seen_all.append(y)
 
     X_seen = np.concatenate(X_seen_all, axis=0)
@@ -126,15 +132,7 @@ def getCrossSubjectDataloader(seen_subjects, unseen_subjects, data_path,
     # 收集 unseen subjects（全部作为跨被试测试）
     X_unseen_all, y_unseen_all = [], []
     for sub in unseen_subjects:
-        X, y = subject_data[sub - 1]
-        if X.shape[1] != 22:
-            raise ValueError(f'被试 {sub:03d} 通道数为 {X.shape[1]}，期望 22')
-
-        if sample_ratio < 1.0:
-            _, X, _, y = train_test_split(
-                X, y, test_size=sample_ratio, stratify=y, random_state=random_state
-            )
-
+        X, y = _load_subject(sub, subject_data, sample_ratio, random_state)
         X_unseen_all.append(X); y_unseen_all.append(y)
 
     X_unseen_test = np.concatenate(X_unseen_all, axis=0)
