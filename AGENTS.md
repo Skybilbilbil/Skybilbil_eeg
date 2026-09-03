@@ -2,6 +2,50 @@
 
 EEG 运动想象(MI)解码研究代码:SPD 流形上的注意力模型(基线为 NeurIPS 2022 MAtt)+ 自研预处理管线。这是研究代码,不是软件工程项目——无 CI、无 lint/format 配置、无测试框架、根目录无依赖清单。改动请最小化、聚焦研究需求。
 
+## 进度同步规则(所有 agent 必须遵守)
+
+**每完成一个大操作(跑完一组实验 / 代码重构 / 数据变更 / 得出重要结论),必须立即把结果同步进下方「项目实时进度」章节**:只写事实(做了什么、结果数字、结论、产物路径),不写过程叙述;新结论推翻旧结论时直接改写对应条目并更新"最后更新"日期。本文件是所有 agent 工具共享的**唯一进度事实源**。
+
+## 项目实时进度(最后更新:2026-09-03)
+
+### 研究焦点与用户决策(2026-09-02/03 确定)
+- **只做 BCI Competition IV-2a(9 人,250Hz);PhysionetMI 暂停**。
+- **不做严格 LOO 跨被试,只做 9 被试混合**(9 人全量试次拼接→60/20/20 随机切分,random_state=42,有被试重叠,数字偏乐观)。
+- 路线:被试内超原文(已达成)→ 攻 9 混合;遇到必须改算法框架的问题时,先全面复盘分析再给建议。
+
+### 代码层状态(2026-09-02 全链路验证通过,无代码问题)
+- `_smoke_test.py` 通过;BCI-2a 单被试被试内训练跑通(`run_matt_physionetmi.py` 改 `CONFIG['dataset']='bci2a'`,sub=1,120it → test_acc 71.55%)。
+- 已知事实:BCI2a 实测 T=1126、E2R M=4 窗(win1.5s/step0.75s);训练默认无 seed(dataloader shuffle 未固定;仅 `train_pair_with_recording.py` 支持 `--seed`,复现实验务必带上);Windows 侧曾出现 25 个假性 M 文件 = CRLF 噪声(`git diff -w` 内容等价),无损还原。
+
+### 核心结果(截至 2026-09-02)
+| 协议 | 峰值 | 最终 | 出处 |
+|---|---|---|---|
+| 被试内 S3 | **82.8%** | 81.0% | `MAtt_baseline/results/profile_final/pair_training.json`(150it, lr5e-4, wd0.02, M=4) |
+| 被试内 S9 | 81.0% | 79.3% | 同上 |
+| 9 混合 cross_mix | 56.5% | 54.5% | 同上 |
+
+- **被试内已超原文 74.71%**(MAtt NeurIPS 2022);9 混合 gap≈24pp = 当前唯一瓶颈。
+- 窗长是框架内最强旋钮(`_exp_compare_summary.json` exp3):win5(2.5s窗) S3=82.8/9mix=56.6;win3(3.5s窗) 9mix=59.8(9mix 最佳)。
+- 类序 left=0/right=1/feet=2/tongue=3;**feet 是混合塌陷最重的类**(cross per-class 0.339,28% 误判为 tongue)。
+
+### 已证伪方向(勿重试)
+- **4-arm 机制定向实验(2026-09-02,seed=42,150it,GPU)**:A 基线 wd0.02→54.6%;B wd0.005→55.5%(train 60.8→64.0 但 test 仅 +0.9pp);C B+正交正则 ortho0.02→55.5%(零增益);D B+固定 C3/Cz/C4 通道掩膜→55.2%(略降)。产物 `MAtt_baseline/results/tune_{a_mixbase,b_mixwd,c_mixwdortho,d_mixcomb}/`,曲线形状四臂一致:it5-30 顶到 54-56% 平台后 test 对训练增长无响应。**框架内正则/掩膜微调不能突破 0.56 混合瓶颈**(train 涨 test 不涨 = 过拟合混合池被试组合)。
+- silhouette(切空间类间分离度):混合全程 ≈0(-0.010~+0.002)vs 被试内 0.062-0.079 → **特征 collapse 是瓶颈的直接量纲**。
+- 更早证伪:多尺度卷积(`profile_ms` 无净收益)、EA 用于混合增强(`official_band_ea` 全表最低 47.6%)。
+
+### 混合瓶颈机制结论
+- 跨被试训练时,不同被试把空间/时间滤波器往相反方向推 → batch 内梯度相消 → conv/IN 权重缩到初值 15-25%(被优化器"删除")→ 注意力输入塌缩;注意力本身不背锅(attn_conc 全程≈1/M 均匀,从未学会选窗)。
+- 生理依据(`results/diagnosis/diagnosis_report.json`):被试间子空间主角度 60.4°(各自用不同电极组合)、MI 响应潜伏期差 7.54 窗、频谱个体差异(固定 8-30Hz 对各人非最优)。
+
+### 待拍板的候选方向(按证据强度排序)
+1. **黎曼域对齐 RA/切空间对齐**(预处理级,零架构改动;Zanini2018、CovMix +4.5~9.4pp;pyriemann 0.10 已装)——默认推荐。
+2. AdaBN 式输入统计对齐(需小改 `build_matt_model`;文献 +7.4pp)。
+3. 逐被试个性化频带 IAF(需重跑预处理;Gaur2021)。
+
+### 运行速查
+- profile 生成器(13 个 argparse 开关全有效):`wsl -e bash -lc 'cd /mnt/d/EEG_Analysis/Riemannian_Trajectories/MAtt_baseline && source ~/miniconda3/etc/profile.d/conda.sh && conda activate eeg_analysis && python train_pair_with_recording.py --out_dir <NAME> --tag <TAG> --seed 42 [--wd 0.005 | --ortho_lambda 0.02 | --channel_gaussian | ...]'`
+- `run_matt_physionetmi.py`(CONFIG 字典)跑 BCI-2a:改 `CONFIG['dataset']='bci2a'` 即可(自动选 pkl + sfreq250);但其 CONFIG **无模型开关**(channel_gaussian/ortho_lambda/manifold_change/attn_* 经 build_matt_model 硬接线默认关),要翻这些开关只能走 train_pair。
+
 ## 结构:两条主线
 
 - **根目录** = 自研预处理管线 + 官方 MAtt 论文复现脚本
@@ -45,11 +89,11 @@ EEG 运动想象(MI)解码研究代码:SPD 流形上的注意力模型(基线为
 
 - **下划线前缀 `_*.py` = 官方 MAtt 复现/对照脚本**(非一次性探针):`_reproduce_official.py`、`_reproduce_seeds.py`、`_ablation_official.py`、`_exp_compare.py`(+ `_exp_compare_summary.json`)、`_verify_newdata_attn.py`、`_smoke_test.py`(无害冒烟)。早期的一次性探针/数据手术脚本已全部删除并提交。
 - 复现/消融脚本只打 stdout 不落盘,需保留数值请自行重定向。
-- 结果命名:`{实验名}_best_{acc,loss}.pt` + 同名 json/png;输出在 `MAtt_baseline/results/{profile_*,diagnosis}/`。
+- 结果命名:`{实验名}_best_{acc,loss}.pt` + 同名 json/png;输出在 `MAtt_baseline/results/{profile_*,tune_*,checkpoint,figures,diagnosis}/`(tune_* 为参数扫描实验,每目录含 pair_training.json 全过程曲线)。
 
 ## Git
 
-- remote `github.com/Skybilbilbil/Skybilbil_eeg`,单分支 `master`;历史含 4 个 refactor 提交(抽取公共 helper、清理死代码/探针、修 sfreq 硬编码)。工作树干净,仅剩 8 个 untracked:AGENTS.md 本身 + 7 个官方复现脚本(`_ablation_official.py`、`_exp_compare.py`、`_exp_compare_summary.json`、`_reproduce_official.py`、`_reproduce_seeds.py`、`_smoke_test.py`、`_verify_newdata_attn.py`)。
+- remote `github.com/Skybilbilbil/Skybilbil_eeg`,单分支 `master`;HEAD=`ab8f64e`,共 9 个提交(初始 d7924b8 → 研究快照 134fc09 → 清理 f514015 → 死代码 e94d6ac → sfreq 修复 513b4e3 → helper 抽取 bc18efa/bdfc118 → AGENTS.md 重写 ab8f64e)。AGENTS.md 本身已被 git 跟踪。工作树仅剩 7 个 untracked 官方复现脚本(`_ablation_official.py`、`_exp_compare.py`、`_exp_compare_summary.json`、`_reproduce_official.py`、`_reproduce_seeds.py`、`_smoke_test.py`、`_verify_newdata_attn.py`);实验产物(results/、*.log)均被 gitignore。
 - 提交信息中文 + Conventional Commits(feat/fix/docs/refactor/chore)。
 
 ## 文档入口
