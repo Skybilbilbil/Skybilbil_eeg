@@ -346,18 +346,31 @@ def save_visualization_data(net, testloader, history, test_acc, args, criterion=
 def build_matt_model(win_samples, step_samples, args):
     """构建 mAtt_bci 滑动窗稀疏流形注意力模型。
 
-    与原始脚本逐字一致: LazyLinear 用 n_windows=None 自适应，构建后按 args 的
-    dropout 概率替换 self.dropout，并按 GPU 可用性决定模型所在设备。
+    参数经 args 字典透传(缺失键取 mAtt_bci 现状默认),dropout 经构造参数传入,
+    LazyLinear 用 n_windows=None 自适应实际窗口数,并按 GPU 可用性决定设备。
     """
     net = mAtt_bci(
         win_samples, step_samples,
-        n_classes=args['n_classes'],
-        local_radius=args['local_radius'],
-        anchor_stride=args['anchor_stride'],
-        n_heads=args['n_heads'],
+        n_classes=args.get('n_classes', 4),
+        d_attn_in=args.get('d_attn_in', 20),
+        d_attn_out=args.get('d_attn_out', 18),
+        local_radius=args.get('local_radius', 1),
+        anchor_stride=args.get('anchor_stride', None),
+        n_heads=args.get('n_heads', 1),
         n_windows=None,          # LazyLinear 自适应实际窗口数（卷积改变时序长度）
+        use_hann=args.get('use_hann', True),
+        conv2_separable=args.get('conv2_separable', False),
+        conv2_multiscale=args.get('conv2_multiscale', False),
+        conv2_ms_per_branch=args.get('conv2_ms_per_branch', None),
+        conv2_ms_specs=args.get('conv2_ms_specs', None),
+        n_spatial_filters=args.get('n_spatial_filters', 22),
+        channel_gaussian=args.get('channel_gaussian', False),
+        gaussian_sigma=args.get('gaussian_sigma', 0.62),
+        attn_change=args.get('attn_change', None),
+        attn_prior=args.get('attn_prior', None),
+        manifold_change=args.get('manifold_change', None),
+        dropout=args.get('dropout', 0.3),
     )
-    net.dropout = nn.Dropout(args.get('dropout', 0.3))
     if torch.cuda.is_available():
         net = net.cuda()
         print(f'使用 GPU: {torch.cuda.get_device_name(0)}')

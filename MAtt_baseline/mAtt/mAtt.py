@@ -1,15 +1,9 @@
 import math
-import os
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mAtt.spd import SPDTransform, SPDTangentSpace, SPDRectified, SPDNorm
-
-# 注意力打分映射开关（原文复现调试用）。
-# 1 = 原文打分 相似度 1/(1+log(1+d²)) + softmax(dim=-2)+permute（经官方数据复现验证：
-#     S01 64.6%→79.5%，9 人平均 53.9%→65.1%，为 MAtt 原文机制，默认开启）
-ATTN_SCORE_ORIGINAL = os.environ.get('ATTN_SCORE_ORIGINAL', '1') == '1'
 
 
 class _Conv2dTemporalSeparable(nn.Module):
@@ -340,7 +334,7 @@ class AttentionManifold(nn.Module):
 
     def __init__(self, in_embed_size, out_embed_size,
                  local_radius=1, anchor_stride=None, n_heads=1,
-                 attn_change=None, attn_prior=None):
+                 attn_change=None, attn_prior=None, score_original=True):
         super().__init__()
         if out_embed_size % n_heads != 0:
             raise ValueError(f'out_embed_size={out_embed_size} 必须能被 n_heads={n_heads} 整除')
@@ -350,6 +344,8 @@ class AttentionManifold(nn.Module):
         self.anchor_stride = anchor_stride
         self.n_heads = n_heads
         self.d_head = out_embed_size // n_heads
+        # 打分映射: True=原文 1/(1+log(1+d²))+softmax(dim=-2)+permute; False=负距离 softmax(dim=-1)
+        self.score_original = score_original
         # 变化感知模式：None=原始(相似匹配)；'ref'=显式静息参考(A)；'diff'=时间差分打分(B)
         if attn_change not in (None, 'ref', 'diff'):
             raise ValueError(f"attn_change 必须为 None/'ref'/'diff'，收到 {attn_change!r}")
@@ -486,7 +482,7 @@ class AttentionManifold(nn.Module):
         inner = logQ[:, qi] - logK[:, kj]       # (bs, n_pairs, d, d)
         energy = (inner ** 2).sum(dim=(-2, -1))  # (bs, n_pairs)
         scores = Q.new_full((bs, m, m), float('-inf'))
-        if ATTN_SCORE_ORIGINAL:
+        if self.score_original:
             # 原文打分：相似度 = 1/(1+log(1+d²))（距离→相似度，压缩动态范围），
             # 然后沿 dim=-2（query 维）softmax，再 permute 使行=key、列=query
             sim = 1.0 / (1.0 + torch.log1p(energy))
@@ -588,7 +584,100 @@ class AttentionManifold(nn.Module):
         return torch.stack(probs).mean(0)
 
 
-class mAtt_bci(nn.Module):
+class _SparseAttentionBase(nn.Module):
+    """三个模型类共享的稀疏流形注意力主干（构造顺序严格保持 mAtt_bci 上游语义，
+    确保 RNG 消耗次序与 state_dict 键名兼容，数值行为逐位不变）。
+
+    主干: [通道加权] → conv1 空间滤波+IN → conv2 时序滤波+IN → E2R 滑动窗协方差
+    → SPDNorm 流形对齐 → ManifoldChange → 流形注意力 → 平滑整流 → 切空间 → 分类头。
+    子类只把各自差异映射成基类参数；forward 由基类共享，get_features 仅在需要的子类暴露。
+    """
+
+    def __init__(self, win_samples, step_samples,
+                 n_classes=4, d_attn_in=20, d_attn_out=18,
+                 local_radius=1, anchor_stride=None, n_heads=1,
+                 n_windows=None, use_hann=True,
+                 use_channel_weight=False, n_spatial_filters=22,
+                 channel_gaussian=False, gaussian_sigma=0.62,
+                 conv1_kernel=22, conv1_out=None,
+                 conv2_kernel=12, conv2_pad=6, conv2_out=None,
+                 conv2_separable=False, conv2_multiscale=False,
+                 conv2_ms_per_branch=None, conv2_ms_specs=None,
+                 manifold_change=None, attn_change=None, attn_prior=None,
+                 dropout=0.3, score_original=True):
+        super().__init__()
+        c1_out = int(n_spatial_filters) if conv1_out is None else int(conv1_out)
+        c2_out = int(d_attn_in) if conv2_out is None else int(conv2_out)
+        # A9: 解剖先验通道加权/删除（数据 22 通道顺序 = BCI2A_CHANNELS）
+        self.channel_weight = (ChannelPriorWeighting(
+            BCI2A_CHANNELS, gaussian=channel_gaussian, gaussian_sigma=gaussian_sigma)
+            if use_channel_weight else None)
+        # FE: 空间滤波（conv1），将 22 通道压缩成 c1_out 个空间分量
+        self.n_spatial_filters = c1_out
+        self.conv1 = nn.Conv2d(1, c1_out, (conv1_kernel, 1))
+        self.In1 = nn.InstanceNorm2d(c1_out, affine=True)   # A8: IN 替代 BN
+        # conv2 实现：全连接时序卷积 / 深度可分离 / 多尺度并联滤波器组
+        if conv2_multiscale:
+            self.conv2 = _Conv2dTemporalMultiScale(
+                c1_out, c2_out,
+                specs=(conv2_ms_specs if conv2_ms_specs is not None
+                       else ((8, 1), (16, 1), (32, 1), (16, 2))),
+                per_branch=conv2_ms_per_branch)
+        elif conv2_separable:
+            self.conv2 = _Conv2dTemporalSeparable(
+                c1_out, c2_out, kernel_size=conv2_kernel, padding=conv2_pad)
+        else:
+            self.conv2 = nn.Conv2d(c1_out, c2_out, (1, conv2_kernel),
+                                   padding=(0, conv2_pad))
+        self.In2 = nn.InstanceNorm2d(c2_out, affine=True)
+        # E2R: Hann 滑动窗 → SPD 流形
+        self.ract1 = E2R(win_samples, step_samples, use_hann=use_hann)
+        # A12: 流形仿射对齐（log 域平移 + 可学习谱缩放），先对齐再进注意力
+        self.spdnorm = SPDNorm(c2_out)
+        # 流形变化特征（相对静息/差分），None=恒等
+        self.manifold_change = ManifoldChange(manifold_change)
+        self.att2 = AttentionManifold(
+            c2_out, d_attn_out,
+            local_radius=local_radius, anchor_stride=anchor_stride, n_heads=n_heads,
+            attn_change=attn_change, attn_prior=attn_prior,
+            score_original=score_original,
+        )
+        self.ract2 = SPDRectified()  # A11: 平滑整流
+        self.tangent = SPDTangentSpace(d_attn_out)
+        self.flat = nn.Flatten()
+        self.dropout = nn.Dropout(dropout) if dropout is not None else None
+        # 每窗口特征 = 切空间向量 d(d+1)/2 维
+        self.feat_per_window = d_attn_out * (d_attn_out + 1) // 2
+        if n_windows is None:
+            self.linear = nn.LazyLinear(n_classes, bias=True)
+        else:
+            self.linear = nn.Linear(n_windows * self.feat_per_window, n_classes, bias=True)
+
+    def _shared_backbone(self, x):
+        if self.channel_weight is not None:
+            x = self.channel_weight(x)
+        x = self.In1(self.conv1(x))
+        x = self.In2(self.conv2(x))
+        spd = self.ract1(x)                     # (B,M,C,C)
+        spd = self.spdnorm(spd)                 # A12
+        spd = self.manifold_change(spd)         # 变化特征（None=恒等）
+        return spd
+
+    def _features(self, x):
+        spd = self._shared_backbone(x)
+        x, shape = self.att2(spd)
+        x = self.ract2(x)
+        x = self.tangent(x)
+        return self.flat(x.view(shape[0], shape[1], -1))
+
+    def forward(self, x):
+        x = self._features(x)
+        if self.dropout is not None:
+            x = self.dropout(x)
+        return self.linear(x)
+
+
+class mAtt_bci(_SparseAttentionBase):
     """滑动窗稀疏流形注意力模型（PhysionetMI / BCI2A 22 通道）
 
     结构: 解剖通道加权(A9) → conv FE + InstanceNorm(A8) → Hann 滑动窗 E2R(A2/A3,
@@ -604,159 +693,56 @@ class mAtt_bci(nn.Module):
                  conv2_ms_per_branch=None, conv2_ms_specs=None,
                  n_spatial_filters=22, channel_gaussian=False,
                  gaussian_sigma=0.62, attn_change=None,
-                 attn_prior=None, manifold_change=None):
-        super().__init__()
-        # A9: 解剖先验通道加权/删除（数据 22 通道顺序 = BCI2A_CHANNELS）
-        #   channel_gaussian=True 时用固定 2D 高斯掩膜（不参与训练），防止跨被试关闭通道
-        self.channel_weight = ChannelPriorWeighting(
-            BCI2A_CHANNELS, gaussian=channel_gaussian, gaussian_sigma=gaussian_sigma)
-
-        # FE: 空间滤波（conv1）将 22 通道压缩为 n_spatial_filters 个空间分量
-        #   （容积传导使通道非独立，更少的分量即可覆盖主要空间结构）
-        # (bs,1,22,T) → (bs,n_spatial_filters,1,T) → (bs,d_attn_in,1,T)
-        n_sp = int(n_spatial_filters)
-        self.n_spatial_filters = n_sp
-        self.conv1 = nn.Conv2d(1, n_sp, (22, 1))
-        self.In1 = nn.InstanceNorm2d(n_sp, affine=True)   # A8: IN 替代 BN，消除跨被试统计漂移
-        # conv2 实现：全连接时序卷积（同上） / 多尺度并联滤波器组 / 深度可分离
-        if conv2_multiscale:
-            self.conv2 = _Conv2dTemporalMultiScale(
-                n_sp, d_attn_in,
-                specs=(conv2_ms_specs if conv2_ms_specs is not None
-                       else ((8, 1), (16, 1), (32, 1), (16, 2))),
-                per_branch=conv2_ms_per_branch)
-        elif conv2_separable:
-            self.conv2 = _Conv2dTemporalSeparable(n_sp, d_attn_in, kernel_size=12, padding=6)
-        else:
-            self.conv2 = nn.Conv2d(n_sp, d_attn_in, (1, 12), padding=(0, 6))
-        self.In2 = nn.InstanceNorm2d(d_attn_in, affine=True)
-
-        # E2R: Hann 滑动窗
-        self.ract1 = E2R(win_samples, step_samples, use_hann=use_hann)
-        # A12: 流形仿射对齐（log 域平移 + 可学习谱缩放），先对齐再进注意力
-        self.spdnorm = SPDNorm(d_attn_in)
-        # 流形变化特征（相对静息/差分），None=恒等
-        self.manifold_change = ManifoldChange(manifold_change)
-
-        self.att2 = AttentionManifold(
-            d_attn_in, d_attn_out,
+                 attn_prior=None, manifold_change=None, dropout=0.3):
+        super().__init__(
+            win_samples, step_samples,
+            n_classes=n_classes, d_attn_in=d_attn_in, d_attn_out=d_attn_out,
             local_radius=local_radius, anchor_stride=anchor_stride, n_heads=n_heads,
-            attn_change=attn_change, attn_prior=attn_prior,
+            n_windows=n_windows, use_hann=use_hann,
+            use_channel_weight=True, n_spatial_filters=n_spatial_filters,
+            channel_gaussian=channel_gaussian, gaussian_sigma=gaussian_sigma,
+            conv1_kernel=22, conv1_out=n_spatial_filters,
+            conv2_kernel=12, conv2_pad=6, conv2_out=d_attn_in,
+            conv2_separable=conv2_separable, conv2_multiscale=conv2_multiscale,
+            conv2_ms_per_branch=conv2_ms_per_branch, conv2_ms_specs=conv2_ms_specs,
+            manifold_change=manifold_change, attn_change=attn_change,
+            attn_prior=attn_prior, dropout=dropout,
         )
-        self.ract2 = SPDRectified()  # A11: 平滑整流
-        self.tangent = SPDTangentSpace(d_attn_out)
-        self.flat = nn.Flatten()
-        self.dropout = nn.Dropout(0.5)  # 对抗过拟合
-
-        # 每窗口特征 = 切空间向量 d(d+1)/2 维
-        self.feat_per_window = d_attn_out * (d_attn_out + 1) // 2
-        if n_windows is None:
-            self.linear = nn.LazyLinear(n_classes, bias=True)
-        else:
-            self.linear = nn.Linear(n_windows * self.feat_per_window, n_classes, bias=True)
-
-    def forward(self, x):
-        x = self.channel_weight(x)
-        x = self.In1(self.conv1(x))
-        x = self.In2(self.conv2(x))
-        spd = self.ract1(x)                     # (B,M,C,C)
-        spd = self.spdnorm(spd)                 # A12
-        spd = self.manifold_change(spd)         # 变化特征（None=恒等）
-        x, shape = self.att2(spd)
-        x = self.ract2(x)
-        x = self.tangent(x)
-        x = x.view(shape[0], shape[1], -1)
-        x = self.flat(x)
-        x = self.dropout(x)                     # 对抗过拟合
-        return self.linear(x)
 
     def get_features(self, x):
         """分类头之前的特征（与 forward 共享主干，用于 silhouette 等）"""
-        x = self.channel_weight(x)
-        x = self.In1(self.conv1(x))
-        x = self.In2(self.conv2(x))
-        spd = self.ract1(x)
-        spd = self.spdnorm(spd)
-        spd = self.manifold_change(spd)
-        x, shape = self.att2(spd)
-        x = self.ract2(x)
-        x = self.tangent(x)
-        return self.flat(x.view(shape[0], shape[1], -1))
+        return self._features(x)
 
 
-class mAtt_mamem(nn.Module):
+class mAtt_mamem(_SparseAttentionBase):
     def __init__(self, win_samples, step_samples, n_classes=5,
                  d_attn_in=15, d_attn_out=12,
                  local_radius=1, anchor_stride=None, n_heads=1,
                  n_windows=None, use_hann=True):
-        super().__init__()
-        self.conv1 = nn.Conv2d(1, d_attn_in, (8, 1))
-        self.In1 = nn.InstanceNorm2d(d_attn_in, affine=True)
-        self.conv2 = nn.Conv2d(d_attn_in, d_attn_in, (1, 36), padding=(0, 18))
-        self.In2 = nn.InstanceNorm2d(d_attn_in, affine=True)
-
-        self.ract1 = E2R(win_samples, step_samples, use_hann=use_hann)
-        self.spdnorm = SPDNorm(d_attn_in)
-        self.att2 = AttentionManifold(
-            d_attn_in, d_attn_out,
+        super().__init__(
+            win_samples, step_samples,
+            n_classes=n_classes, d_attn_in=d_attn_in, d_attn_out=d_attn_out,
             local_radius=local_radius, anchor_stride=anchor_stride, n_heads=n_heads,
+            n_windows=n_windows, use_hann=use_hann,
+            use_channel_weight=False,
+            conv1_kernel=8, conv1_out=d_attn_in,
+            conv2_kernel=36, conv2_pad=18, conv2_out=d_attn_in,
+            dropout=None,
         )
-        self.ract2 = SPDRectified()
-        self.tangent = SPDTangentSpace(d_attn_out)
-        self.flat = nn.Flatten()
-        self.feat_per_window = d_attn_out * (d_attn_out + 1) // 2
-        if n_windows is None:
-            self.linear = nn.LazyLinear(n_classes, bias=True)
-        else:
-            self.linear = nn.Linear(n_windows * self.feat_per_window, n_classes, bias=True)
-
-    def forward(self, x):
-        x = self.In1(self.conv1(x))
-        x = self.In2(self.conv2(x))
-        spd = self.ract1(x)
-        spd = self.spdnorm(spd)
-        x, shape = self.att2(spd)
-        x = self.ract2(x)
-        x = self.tangent(x)
-        x = x.view(shape[0], shape[1], -1)
-        x = self.flat(x)
-        return self.linear(x)
 
 
-class mAtt_cha(nn.Module):
+class mAtt_cha(_SparseAttentionBase):
     def __init__(self, win_samples, step_samples, n_classes=2,
                  d_attn_in=16, d_attn_out=8,
                  local_radius=1, anchor_stride=None, n_heads=1,
                  n_windows=None, use_hann=True):
-        super().__init__()
-        self.conv1 = nn.Conv2d(1, 22, (56, 1))
-        self.In1 = nn.InstanceNorm2d(22, affine=True)
-        self.conv2 = nn.Conv2d(22, d_attn_in, (1, 64), padding=(0, 32))
-        self.In2 = nn.InstanceNorm2d(d_attn_in, affine=True)
-
-        self.ract1 = E2R(win_samples, step_samples, use_hann=use_hann)
-        self.spdnorm = SPDNorm(d_attn_in)
-        self.att2 = AttentionManifold(
-            d_attn_in, d_attn_out,
+        super().__init__(
+            win_samples, step_samples,
+            n_classes=n_classes, d_attn_in=d_attn_in, d_attn_out=d_attn_out,
             local_radius=local_radius, anchor_stride=anchor_stride, n_heads=n_heads,
+            n_windows=n_windows, use_hann=use_hann,
+            use_channel_weight=False,
+            conv1_kernel=56, conv1_out=22,
+            conv2_kernel=64, conv2_pad=32, conv2_out=d_attn_in,
+            dropout=None,
         )
-        self.ract2 = SPDRectified()
-        self.tangent = SPDTangentSpace(d_attn_out)
-        self.flat = nn.Flatten()
-        self.feat_per_window = d_attn_out * (d_attn_out + 1) // 2
-        if n_windows is None:
-            self.linear = nn.LazyLinear(n_classes, bias=True)
-        else:
-            self.linear = nn.Linear(n_windows * self.feat_per_window, n_classes, bias=True)
-
-    def forward(self, x):
-        x = self.In1(self.conv1(x))
-        x = self.In2(self.conv2(x))
-        spd = self.ract1(x)
-        spd = self.spdnorm(spd)
-        x, shape = self.att2(spd)
-        x = self.ract2(x)
-        x = self.tangent(x)
-        x = x.view(shape[0], shape[1], -1)
-        x = self.flat(x)
-        return self.linear(x)

@@ -24,8 +24,8 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
 
-from mAtt.mAtt import mAtt_bci
 from mAtt.optimizer import MixOptimizer
+from utils.functions import build_matt_model
 from analyze_cross_pipeline import (
     FeatureRecorder, batch_to_vectors, LAYER_ORDER, LAYER_DISP,
     WIN_SAMPLES, STEP_SAMPLES, DEVICE,
@@ -63,6 +63,10 @@ _parser.add_argument('--attn_prior', type=str, default=None,
 _parser.add_argument('--manifold_change', type=str, default=None,
                      help='SPD 流形"相对变化"特征: None=恒等(绝对SPD) | le_win0=相对窗0静息 | '
                           'le_diff1=一阶时间差分 | le_diff2=二阶时间差分')
+_parser.add_argument('--channel_prior_eps', type=float, default=0.0,
+                     help='通道权重"先验锚定微调": >0 时每个优化步后把 scale 钳制到 '
+                          '先验±eps·先验 的邻域内（仅非 channel_gaussian 模式生效），'
+                          '验证"生理先验 + 受限学习"能否保住通道结构')
 _args = _parser.parse_args()
 N_SPATIAL_FILTERS = _args.n_spatial_filters
 TAG = _args.tag
@@ -80,6 +84,7 @@ ATTN_PRIOR = (tuple(float(v) for v in _args.attn_prior.split(','))
 if ATTN_PRIOR is not None and len(ATTN_PRIOR) < 8:
     print(f'[WARN] attn_prior 长度 {len(ATTN_PRIOR)} < 窗口数, 末窗可能缺值')
 MANIFOLD_CHANGE = _args.manifold_change
+CHANNEL_PRIOR_EPS = _args.channel_prior_eps
 
 OUT_DIR = BASE / 'results' / _args.out_dir
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -293,23 +298,34 @@ def conv1_ortho_penalty(net, lam):
     return 0.5 * lam * ((g - eye) ** 2).sum()
 
 
-def train_with_record(tag, net, tr_ld, va_ld, te_ld, M, ckpt_prefix,
-                      ortho_lambda=ORTHO_LAMBDA):
-    """训练一个模型并全程记录过程数据"""
-    print(f'\n===== 训练 {tag} =====')
-    t0 = time.time()
-    # 推断真实窗口数 m（卷积会改变时序长度，硬编码 M 可能与实际不符）
+def _infer_windows(net, tr_ld):
+    """推断真实窗口数 m（卷积会改变时序长度，硬编码 M 可能与实际不符）
+
+    取一个 mini-batch 前向到 att2，经 shape 返回获取实际窗口数。
+    仅用于记录/切片语义（feature_snapshot），与 LazyLinear 的分类器输入维解耦。
+    """
     net.eval()
     with torch.no_grad():
-        # 取一个 mini-batch 做前向，经 att2 的 shape 返回获取实际窗口数 m
         for probe_b, _ in tr_ld:
             probe_b = probe_b.to(DEVICE)
             break
-        x = net.channel_weight(probe_b)
+        x = net.channel_weight(probe_b) if net.channel_weight is not None else probe_b
         x = net.In1(net.conv1(x)); x = net.In2(net.conv2(x))
         spd = net.ract1(x); spd = net.spdnorm(spd)
         _, shape = net.att2(spd)
-        m_real = shape[1]
+        return int(shape[1])
+
+
+def train_with_record(tag, net, tr_ld, va_ld, te_ld, M, ckpt_prefix,
+                      ortho_lambda=ORTHO_LAMBDA, channel_prior=None,
+                      channel_prior_eps=0.0):
+    """训练一个模型并全程记录过程数据"""
+    if channel_prior_eps > 0 and channel_prior is not None:
+        print(f'   [通道先验锚定] eps={channel_prior_eps}, '
+              f'scale 每步钳制在 先验±{channel_prior_eps}·先验')
+    print(f'\n===== 训练 {tag} =====')
+    t0 = time.time()
+    m_real = _infer_windows(net, tr_ld)
     if m_real and m_real != M:
         print(f'   [窗口数修正] M={M} → 实际 m={m_real}（卷积后时序长度变化导致）')
         M = m_real
@@ -336,6 +352,14 @@ def train_with_record(tag, net, tr_ld, va_ld, te_ld, M, ckpt_prefix,
             loss.backward()
             nn.utils.clip_grad_norm_(net.parameters(), GRAD_CLIP)
             opt.step()
+            if channel_prior_eps > 0 and channel_prior is not None:
+                # 通道权重先验锚定：Δ=scale−prior 被钳制在 ±eps·prior 邻域，
+                # 允许受限学习（而不被互斥投票推离生理先验/推向原点）
+                with torch.no_grad():
+                    s = net.channel_weight.scale
+                    p = channel_prior.to(s.device)
+                    s.copy_(p + torch.clamp(s - p, -channel_prior_eps * p,
+                                            channel_prior_eps * p))
             loss_sum += loss.item()
             acc_tr += (out.argmax(1) == yb).sum().item()
             nb += 1
@@ -402,44 +426,51 @@ def main():
     results = {'config': {'subjects': PAIR_SUBJECTS, 'iterations': ITERATIONS,
                           'lr': LR, 'wd': WD, 'n_windows': M}, 'models': {}}
 
+    def _make_net():
+        """统一经 build_matt_model 构建(参数齐全,dropout 走构造传入)"""
+        return build_matt_model(WIN_SAMPLES, STEP_SAMPLES, {
+            'n_classes': N_CLASSES,
+            'd_attn_in': D_ATTN_IN,
+            'd_attn_out': D_ATTN_OUT,
+            'local_radius': LOCAL_RADIUS,
+            'anchor_stride': None,
+            'n_heads': 1,
+            'n_windows': None,
+            'conv2_separable': False,
+            'conv2_multiscale': CONV2_MULTISCALE,
+            'conv2_ms_per_branch': CONV2_MS_PER_BRANCH,
+            'conv2_ms_specs': CONV2_MS_SPECS,
+            'n_spatial_filters': N_SPATIAL_FILTERS,
+            'channel_gaussian': CHANNEL_GAUSSIAN,
+            'gaussian_sigma': 0.62,
+            'attn_change': ATTN_CHANGE,
+            'attn_prior': ATTN_PRIOR,
+            'manifold_change': MANIFOLD_CHANGE,
+            'dropout': DROP_PROB,
+        })
+
     # 被试内
     for sid in PAIR_SUBJECTS:
         X_tr, y_tr, X_va, y_va, X_te, y_te = splits[sid]
         tr_ld, va_ld, te_ld = make_loaders(X_tr, y_tr, X_va, y_va, X_te, y_te)
-        net = mAtt_bci(WIN_SAMPLES, STEP_SAMPLES, n_classes=N_CLASSES,
-                       d_attn_in=D_ATTN_IN, d_attn_out=D_ATTN_OUT, n_windows=None,
-                       n_spatial_filters=N_SPATIAL_FILTERS,
-                       channel_gaussian=CHANNEL_GAUSSIAN,
-                       conv2_multiscale=CONV2_MULTISCALE,
-                       conv2_ms_per_branch=CONV2_MS_PER_BRANCH,
-                       conv2_ms_specs=CONV2_MS_SPECS,
-                       local_radius=LOCAL_RADIUS,
-                       attn_change=ATTN_CHANGE,
-                       attn_prior=ATTN_PRIOR,
-                       manifold_change=MANIFOLD_CHANGE).to(DEVICE)
-        net.dropout = nn.Dropout(DROP_PROB)
+        net = _make_net()
+        _prior = (net.channel_weight.scale.detach().clone() if
+                  (CHANNEL_PRIOR_EPS > 0 and not CHANNEL_GAUSSIAN) else None)
         rec = train_with_record(f'S{sid:02d} 被试内', net, tr_ld, va_ld, te_ld, M,
-                                f'{TAG}_within_S{sid}')
+                                f'{TAG}_within_S{sid}',
+                                channel_prior=_prior, channel_prior_eps=CHANNEL_PRIOR_EPS)
         results['models'][f'within_S{sid}'] = {'tag': f'S{sid} 被试内', **rec}
         del net
 
     # 9人混合
     X_tr, y_tr, X_va, y_va, X_te, y_te = cross_split
     tr_ld, va_ld, te_ld = make_loaders(X_tr, y_tr, X_va, y_va, X_te, y_te)
-    net = mAtt_bci(WIN_SAMPLES, STEP_SAMPLES, n_classes=N_CLASSES,
-                   d_attn_in=D_ATTN_IN, d_attn_out=D_ATTN_OUT, n_windows=None,
-                   n_spatial_filters=N_SPATIAL_FILTERS,
-                   channel_gaussian=CHANNEL_GAUSSIAN,
-                   conv2_multiscale=CONV2_MULTISCALE,
-                   conv2_ms_per_branch=CONV2_MS_PER_BRANCH,
-                   conv2_ms_specs=CONV2_MS_SPECS,
-                   local_radius=LOCAL_RADIUS,
-                   attn_change=ATTN_CHANGE,
-                   attn_prior=ATTN_PRIOR,
-                   manifold_change=MANIFOLD_CHANGE).to(DEVICE)
-    net.dropout = nn.Dropout(DROP_PROB)
+    net = _make_net()
+    _prior = (net.channel_weight.scale.detach().clone() if
+              (CHANNEL_PRIOR_EPS > 0 and not CHANNEL_GAUSSIAN) else None)
     rec = train_with_record('9人混合跨被试', net, tr_ld, va_ld, te_ld, M,
-                            f'{TAG}_cross_mix')
+                            f'{TAG}_cross_mix',
+                            channel_prior=_prior, channel_prior_eps=CHANNEL_PRIOR_EPS)
     results['models']['cross_mix'] = {'tag': '9人混合跨被试', **rec}
 
     # 保存
