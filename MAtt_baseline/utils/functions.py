@@ -5,7 +5,7 @@ import os
 sys.path.append("..")
 from mAtt.optimizer import MixOptimizer
 from mAtt.mAtt import mAtt_bci
-from sklearn.metrics import roc_auc_score as ras, silhouette_score
+from sklearn.metrics import silhouette_score
 import numpy as np
 
 
@@ -189,21 +189,6 @@ def testNetwork(net, testloader):
             total += yb.shape[0]
 
     return acc / max(total, 1)
-
-
-def testNetwork_auc(net, testloader):
-    device = next(net.parameters()).device
-    net.eval()
-    y_pred = torch.empty(0, device=device)
-    y_true = torch.empty(0, device=device)
-    with torch.no_grad():
-        for xb, yb in testloader:
-            xb, yb = _move_to_device(xb, yb, device)
-            pred = net(xb)
-            y_pred = torch.cat((y_pred, pred[:, 1]), 0)
-            y_true = torch.cat((y_true, yb.float()), 0)
-
-    return ras(y_true.detach().cpu().numpy(), y_pred.detach().cpu().numpy())
 
 
 # ============================================================

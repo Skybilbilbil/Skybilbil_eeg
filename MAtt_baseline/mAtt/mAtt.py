@@ -712,37 +712,3 @@ class mAtt_bci(_SparseAttentionBase):
     def get_features(self, x):
         """分类头之前的特征（与 forward 共享主干，用于 silhouette 等）"""
         return self._features(x)
-
-
-class mAtt_mamem(_SparseAttentionBase):
-    def __init__(self, win_samples, step_samples, n_classes=5,
-                 d_attn_in=15, d_attn_out=12,
-                 local_radius=1, anchor_stride=None, n_heads=1,
-                 n_windows=None, use_hann=True):
-        super().__init__(
-            win_samples, step_samples,
-            n_classes=n_classes, d_attn_in=d_attn_in, d_attn_out=d_attn_out,
-            local_radius=local_radius, anchor_stride=anchor_stride, n_heads=n_heads,
-            n_windows=n_windows, use_hann=use_hann,
-            use_channel_weight=False,
-            conv1_kernel=8, conv1_out=d_attn_in,
-            conv2_kernel=36, conv2_pad=18, conv2_out=d_attn_in,
-            dropout=None,
-        )
-
-
-class mAtt_cha(_SparseAttentionBase):
-    def __init__(self, win_samples, step_samples, n_classes=2,
-                 d_attn_in=16, d_attn_out=8,
-                 local_radius=1, anchor_stride=None, n_heads=1,
-                 n_windows=None, use_hann=True):
-        super().__init__(
-            win_samples, step_samples,
-            n_classes=n_classes, d_attn_in=d_attn_in, d_attn_out=d_attn_out,
-            local_radius=local_radius, anchor_stride=anchor_stride, n_heads=n_heads,
-            n_windows=n_windows, use_hann=use_hann,
-            use_channel_weight=False,
-            conv1_kernel=56, conv1_out=22,
-            conv2_kernel=64, conv2_pad=32, conv2_out=d_attn_in,
-            dropout=None,
-        )
