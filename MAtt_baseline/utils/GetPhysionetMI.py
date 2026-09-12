@@ -53,22 +53,40 @@ def load_preprocessed_physionetmi(pkl_path):
     return load_preprocessed_dataset(pkl_path)
 
 
-def split_train_valid_test(X, y, train_ratio=0.6, valid_ratio=0.2, random_state=42):
+def split_train_valid_test(X, y, train_ratio=0.6, valid_ratio=0.2, random_state=42,
+                           others=None):
     """
     分层划分 train / valid / test
+
+    others: 可选 [数组, ...]，必须与 X 第 0 维等长。返回时按同样的切分索引
+    一并划分，用于携带试次级元数据（如被试归属 sub_id，供 per-subject conv1
+    路由）。返回格式: X_train,y_train,X_valid,y_valid,X_test,y_test 后紧跟
+    others 中各数组的 (train, valid, test) 三份（按传入顺序）。
     """
-    # 先划分 test
-    X_trval, X_test, y_trval, y_test = train_test_split(
-        X, y, test_size=(1 - train_ratio - valid_ratio),
+    parts = [X] + (list(others) if others else [])
+    outs = train_test_split(
+        *parts, y, test_size=(1 - train_ratio - valid_ratio),
         stratify=y, random_state=random_state
     )
-    # 再划分 valid
-    valid_size = valid_ratio / (train_ratio + valid_ratio)
-    X_train, X_valid, y_train, y_valid = train_test_split(
-        X_trval, y_trval, test_size=valid_size,
+    # outs: [X_trval, X_test, o1_trval, o1_test, ..., y_trval, y_test]
+    X_trval, X_test = outs[0], outs[1]
+    y_trval, y_test = outs[-2], outs[-1]
+    o_trval = outs[2:-2:2]
+    o_test = outs[3:-2:2]
+    rest = [X_trval] + o_trval + [y_trval]
+    outs2 = train_test_split(
+        *rest, test_size=valid_ratio / (train_ratio + valid_ratio),
         stratify=y_trval, random_state=random_state
     )
-    return X_train, y_train, X_valid, y_valid, X_test, y_test
+    # outs2: [X_tr, X_va, o1_tr, o1_va, ..., y_tr, y_va]
+    X_train, X_valid = outs2[0], outs2[1]
+    y_train, y_valid = outs2[-2], outs2[-1]
+    o_train = outs2[2:-2:2]
+    o_valid = outs2[3:-2:2]
+    ret = [X_train, y_train, X_valid, y_valid, X_test, y_test]
+    for ot, ov, oe in zip(o_train, o_valid, o_test):
+        ret += [ot, ov, oe]
+    return ret
 
 
 def _load_subject(sub, subject_data, sample_ratio, random_state):

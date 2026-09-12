@@ -4,7 +4,7 @@ import sys
 import os
 sys.path.append("..")
 from mAtt.optimizer import MixOptimizer
-from mAtt.mAtt import mAtt_bci
+from mAtt.mAtt import mAtt_bci, BCI2A_CHANNELS  # BCI2A_CHANNELS 唯一定义在 mAtt.mAtt
 from sklearn.metrics import silhouette_score
 import numpy as np
 
@@ -197,14 +197,6 @@ def testNetwork(net, testloader):
 # ============================================================
 
 
-BCI2A_CHANNELS = [
-    'Fz', 'FC3', 'FC1', 'FCz', 'FC2', 'FC4',
-    'C5', 'C3', 'C1', 'Cz', 'C2', 'C4', 'C6',
-    'CP3', 'CP1', 'CPz', 'CP2', 'CP4',
-    'P1', 'Pz', 'P2', 'POz'
-]
-
-
 def resolve_path(path):
     """相对路径按脚本所在目录解析；绝对路径保持不变"""
     from pathlib import Path
@@ -355,6 +347,9 @@ def build_matt_model(win_samples, step_samples, args):
         attn_prior=args.get('attn_prior', None),
         manifold_change=args.get('manifold_change', None),
         dropout=args.get('dropout', 0.3),
+        per_subject_conv1=args.get('per_subject_conv1', 0),
+        per_subject_conv2=args.get('per_subject_conv2', 0),
+        norm_type=args.get('norm_type', 'in'),
     )
     if torch.cuda.is_available():
         net = net.cuda()

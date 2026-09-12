@@ -47,9 +47,10 @@ def select_channels_physionetmi(raw):
             f"缺失: {sorted(missing)}。原始通道名示例: {raw_copy.ch_names[:10]}"
         )
 
-    # PhysionetMI 的 EOG 通道可能是 EOG1, EOG2, EOG3 或其他命名
-    eog_channels = [ch for ch in raw_copy.ch_names if 'EOG' in ch.upper()]
-    channels_to_keep.extend([ch for ch in eog_channels if ch in raw_copy.ch_names])
+    # 保留 eog 类型通道:BCI 的 EOG1/2/3 名字含 EOG,Physionet loader 标记的
+    # Fp1/Fp2 伪参考名字不含 EOG,统一按 eog 类型(而非名字)识别保留
+    eog_channels = [raw_copy.ch_names[i] for i in mne.pick_types(raw_copy.info, eog=True, exclude=[])]
+    channels_to_keep.extend(eog_channels)
 
     raw_copy.pick_channels(channels_to_keep)
 
@@ -108,7 +109,8 @@ def ica_denoise(raw, threshold=2.5, max_exclude=2, adaptive_threshold=True):
     # 在 1Hz 滤波后的数据上拟合，但最终应用在未过度滤波的数据上
     ica.fit(raw_for_ica, verbose=False)
     
-    eog_chs =[ch for ch in raw_clean.ch_names if 'EOG' in ch.upper()]
+    # 按 eog 类型识别参考通道(BCI 真实 EOG / Physionet Fp1/Fp2 伪参考均为此类型)
+    eog_chs = [raw_clean.ch_names[i] for i in mne.pick_types(raw_clean.info, eog=True, exclude=[])]
     detected_components =[]
     eog_detection_used = False
 

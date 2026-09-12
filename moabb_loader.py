@@ -173,8 +173,16 @@ def _load_run_raw(path: Path) -> mne.io.BaseRaw:
     # 立即降维：只保留 SELECTED_CHANNEL_NAMES 对应的 22 通道（兼容带后缀的 EDF 命名）
     norm = {_normalize_ch_name(c): c for c in raw.ch_names}
     keep = [norm[n] for n in map(_normalize_ch_name, SELECTED_CHANNEL_NAMES) if n in norm]
+    # 对照 BCI:BCI 原生有真实 EOG1/2/3 通道,loader 保留后供 ica.find_bads_eog
+    # 做眼电子伪迹参考(对齐官方 EOG 回归清洗);Physionet eegmmidb 只有 64 个纯
+    # EEG 通道无 EOG,但最接近眼电的前额通道 Fp1/Fp2 同样可作参考,这里一并保留并
+    # 标记为 eog 类型,让 ICA 能按"眼电参考"检测伪迹,替代统计峰度降级兜底方案。
+    # ICA 完成后 eog 会被 drop,最终 pkl 仍只含 22 个 EEG 通道。
+    keep_eog = [norm[ni] for ni in map(_normalize_ch_name, ('Fp1', 'Fp2')) if ni in norm]
     if len(keep) == len(SELECTED_CHANNEL_NAMES):
-        raw.pick_channels(keep)
+        raw.pick_channels(keep + keep_eog)
+        if keep_eog:
+            raw.set_channel_types({ch: 'eog' for ch in keep_eog})
     return raw
 
 
