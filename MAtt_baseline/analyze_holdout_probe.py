@@ -27,14 +27,14 @@ from utils.GetPhysionetMI import load_preprocessed_dataset, split_train_valid_te
 from utils.functions import build_matt_model
 
 DATA = BASE.parent / 'saved_data' / 'preprocessed_data_bci2a_raw_ica.pkl'
-HOLDOUTS = [9]         # 对照:用带 seed 的当前脚本重跑 S09,排查"未设种子"的混杂
+HOLDOUTS = [8, 3]      # LDA 接收性排名 1、2(S08 36.1% / S03 35.4%),高于已测的 S09(33.1%)
 SEED = 42
 BS, ITERS, LR, WD, CLIP = 64, 150, 5e-4, 0.02, 1.0
 CFG = dict(n_classes=4, d_attn_in=8, d_attn_out=8, local_radius=6, anchor_stride=None,
            n_heads=1, n_windows=None, conv2_separable=False, conv2_multiscale=False,
            conv2_ms_per_branch=None, conv2_ms_specs=None, n_spatial_filters=22,
            channel_gaussian=False, gaussian_sigma=0.62, attn_change=None, attn_prior=None,
-           manifold_change=None, dropout=0.3, per_subject_conv1=0, per_subject_conv2=0)
+           manifold_change=None, dropout=0.3)
 DEV = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 

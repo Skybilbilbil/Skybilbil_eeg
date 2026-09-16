@@ -25,8 +25,7 @@ BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
 
 from mAtt.optimizer import MixOptimizer
-from mAtt.mAtt import (_PerSubjectConv2d, _PerSubjectConv2dTemporal,
-                       BACKEND_PREFIXES)
+from mAtt.mAtt import BACKEND_PREFIXES
 from utils.functions import build_matt_model
 from analyze_cross_pipeline import (
     FeatureRecorder, batch_to_vectors, LAYER_ORDER, LAYER_DISP,
@@ -69,17 +68,14 @@ _parser.add_argument('--channel_prior_eps', type=float, default=0.0,
                      help='通道权重"先验锚定微调": >0 时每个优化步后把 scale 钳制到 '
                           '先验±eps·先验 的邻域内（仅非 channel_gaussian 模式生效），'
                           '验证"生理先验 + 受限学习"能否保住通道结构')
-_parser.add_argument('--per_subject_conv1', type=int, default=0,
-                     help='conv1 改为逐被试独立空间滤波器组(>1=被试数)。梯度隔离,'
-                          '检验"空间滤波逐被试应对通道差异"能否解 conv1 塌缩;'
-                          '仅作用于 9 人混合分支,被试内仍走共享路径')
-_parser.add_argument('--per_subject_conv2', type=int, default=0,
-                     help='conv2 改为逐被试独立时序滤波器组(>1=被试数)。与 '
-                          '--per_subject_conv1 共用时检验"前端(空间+频率)全 per-subject '
-                          '能否逼近被试内水平"（判定瓶颈在前端共享还是后端可分性）')
+
 _parser.add_argument('--dataset', type=str, default='bci2a', choices=['bci2a', 'physionetmi'],
                      help='数据集: bci2a=BCI-IV-2a(9人,250Hz) | physionetmi=PhysionetMI'
                           '(103人,160Hz)。决定 pkl 路径与窗口采样数换算')
+_parser.add_argument('--split', type=str, default='samepool',
+                     choices=['samepool', 'cross_session'],
+                     help='主协议 samepool(默认)=全部公开 trial 按类别分层随机 70/15/15 切分；'
+                          '模型不接收 subject_id。cross_session 仅保留为 session 偏移诊断。')
 _parser.add_argument('--save_backend', type=str, default=None,
                      help='训练完成后把"后端统一模型"权重(=E2R之后 att2/ract2/tangent/flat/'
                           'dropout/linear/spdnorm/manifold_change 可学习层)单独保存到该路径,'
@@ -93,10 +89,13 @@ _parser.add_argument('--freeze_backend', action='store_true',
                      help='与 --load_backend 并用:加载后端后冻结全部后端参数'
                           '(requires_grad=False),训练时只更新前端的 conv/IN/channel_weight,'
                           '实现"改进 conv 前端时后端完全不动、无需重训"。')
-_parser.add_argument('--iterations', type=int, default=150,
-                     help='训练迭代数(历史全部实验=150,已证伪方向复现勿改;只有做耗时权衡时降)')
-_parser.add_argument('--batch_size', type=int, default=64,
-                     help='batch size(历史=64。103人全量混合需 ≤10min 时用 128:步数减半)')
+_parser.add_argument('--iterations', type=int, default=100,
+                     help='训练迭代数(默认 100 -> 全量一次约 3.5min;'
+                          '历史全部结论是 150,复现历史数字请显式传 --iterations 150)')
+_parser.add_argument('--batch_size', type=int, default=128,
+                     help='batch size(默认 128:实测吞吐最优,每 epoch 1.43s vs bs64 的 2.13s,'
+                          '显存 3.3GB;bs256 每 epoch 反而回落到 1.56s 且占 6.6GB。'
+                          '复现历史数字请显式传 --batch_size 64)')
 _parser.add_argument('--snap_every', type=int, default=10,
                      help='每 N 迭代拍一次诊断快照(特征/silhouette/注意力);频率越高曲线越密但越慢')
 _parser.add_argument('--sil_max', type=int, default=2000,
@@ -134,8 +133,6 @@ if ATTN_PRIOR is not None and len(ATTN_PRIOR) < 8:
     print(f'[WARN] attn_prior 长度 {len(ATTN_PRIOR)} < 窗口数, 末窗可能缺值')
 MANIFOLD_CHANGE = _args.manifold_change
 CHANNEL_PRIOR_EPS = _args.channel_prior_eps
-PER_SUBJECT_CONV1 = _args.per_subject_conv1
-PER_SUBJECT_CONV2 = _args.per_subject_conv2
 DATASET_NAME = _args.dataset
 SAVE_BACKEND_PATH = _args.save_backend
 LOAD_BACKEND_PATH = _args.load_backend
@@ -147,6 +144,7 @@ SIL_MAX = _args.sil_max
 GRAD_PROBE = _args.grad_probe
 PROBE_PER_SUBJECT = _args.probe_per_subject
 SKIP_WITHIN = _args.skip_within
+SPLIT = _args.split
 MAX_SUBJECTS = _args.max_subjects
 NORM_TYPE = _args.norm
 BN_RECALIB = _args.bn_recalib
@@ -178,9 +176,14 @@ else:
     FS = 250
 WIN_SAMPLES = int(round(1.5 * FS))    # 窗长 1.5s
 STEP_SAMPLES = int(round(0.75 * FS))  # 步长 0.75s（50% 重叠）
+if SPLIT == 'cross_session' and DATASET_NAME != 'bci2a':
+    raise SystemExit('[错误] --split cross_session 只支持 bci2a (physionetmi 无 session 结构)')
 print(f'[数据集] {DATASET_NAME}: fs={FS}Hz, win={WIN_SAMPLES}点({WIN_SAMPLES/FS:.2f}s), '
       f'step={STEP_SAMPLES}点({STEP_SAMPLES/FS:.2f}s)')
-SAMPLE_RATIO = 0.5
+print(f'[切分口径] --split {SPLIT}: ' + (
+    'session0 训练/验证 + session1 标签隔离测试（诊断口径；当前 EA 为转导式）'
+    if SPLIT == 'cross_session' else
+    '全部公开 trial 按类别分层随机 70/15/15（主协议）'))
 N_CLASSES = 4
 D_ATTN_IN, D_ATTN_OUT = 8, 8
 PAIR_SUBJECTS = [3, 9]
@@ -188,7 +191,7 @@ PAIR_SUBJECTS = [3, 9]
 ITERATIONS = _args.iterations
 LR = 5e-4
 GRAD_CLIP = 1.0
-LOCAL_RADIUS = 6      # 全连接注意力（M=4 时覆盖全部窗口）；保留原注意力机制的完整交互
+LOCAL_RADIUS = 6      # 全连接注意力（实际 M=5 时覆盖全部窗口）；保留原注意力机制的完整交互
 DROP_PROB = 0.3       # dropout（验证过的折中值：0.5 偏重，0.3 平衡效果与正则）
 TEST_EVERY = 5
 
@@ -208,28 +211,88 @@ PARAM_GROUPS = [
 ]
 
 
+def _session_index(y):
+    """单被试内的 session 标签: 类内前半 = session 0train, 后半 = session 1test。
+
+    依据 moabb_loader_bci2a.py:87-97 —— 两个 session 的 raw 用 sorted(sessions)
+    顺序拼接(0train → 1test)后再按时间顺序 epoch, 所以类内试次顺序 = session 顺序。
+    每 session 每类 72 试次, 故类内 144 个试次前 72/后 72 即两个 session。
+
+    ⚠ 只对【单个被试】的标签数组成立。跨被试拼接的 y_all 上, 同一类别的索引
+    会横跨全部被试, np.unique(y) 分不出被试边界 → session 标签全错。
+    所以 y_all 必须逐被试调用本函数后再拼接(见 load_data)。
+    """
+    sess = np.zeros(len(y), dtype=np.int64)
+    for c in np.unique(y):
+        idx = np.where(y == c)[0]
+        if len(idx) % 2:
+            raise ValueError(f'类别 {c} 有 {len(idx)} 个试次(奇数), 无法按 session 对半分')
+        sess[idx[len(idx) // 2:]] = 1
+    return sess
+
+
+def split_by_session(X, y, sess, valid_ratio=0.25, random_state=42, others=None):
+    """跨 session 切分: session1 全部作测试, session0 内再切 train/valid。
+
+    sess 由调用方给出(必须逐被试算 _session_index 再拼接, 见 load_data)。
+    返回格式与 split_train_valid_test 完全一致(6 + 3*len(others) 项),
+    以便 main() 里两条路径共用同一套解包代码。
+    """
+    from sklearn.model_selection import train_test_split
+    assert len(sess) == len(y), 'session 标签长度与标签数组不一致'
+    m0, m1 = np.where(sess == 0)[0], np.where(sess == 1)[0]
+    parts = [X] + (list(others) if others else [])
+    o = train_test_split(*[p[m0] for p in parts], y[m0],
+                         test_size=valid_ratio, stratify=y[m0],
+                         random_state=random_state)
+    # o: X_tr, X_va, o1_tr, o1_va, ..., y_tr, y_va
+    ret = [o[0], o[-2], o[1], o[-1], X[m1], y[m1]]
+    for i, (ot, ov) in enumerate(zip(o[2:-2:2], o[3:-2:2])):
+        ret += [ot, ov, others[i][m1]]
+    return ret
+
+
 def load_data():
     subject_data, _ = load_preprocessed_dataset(DATA_PATH)
     if MAX_SUBJECTS > 0:
         subject_data = subject_data[:MAX_SUBJECTS]
     T = subject_data[0][0].shape[-1]
     M = (T - WIN_SAMPLES) // STEP_SAMPLES + 1
-    from sklearn.model_selection import train_test_split
     splits = {}
     for sid in PAIR_SUBJECTS:
         if sid > len(subject_data):      # --max_subjects 截断后跳过不存在的被试
             continue
         X, y = subject_data[sid - 1]
-        _, X, _, y = train_test_split(X, y, test_size=SAMPLE_RATIO, stratify=y, random_state=42)
-        X_tr, y_tr, X_va, y_va, X_te, y_te = split_train_valid_test(X, y)
+        if SPLIT == 'cross_session':
+            # 跨 session: session0 训/验、session1 测(不再丢弃一半数据)
+            X_tr, y_tr, X_va, y_va, X_te, y_te = split_by_session(X, y, _session_index(y))
+        else:
+            X_tr, y_tr, X_va, y_va, X_te, y_te = split_train_valid_test(
+                X, y, train_ratio=0.70, valid_ratio=0.15, random_state=42)
         splits[sid] = (X_tr, y_tr, X_va, y_va, X_te, y_te)
     X_all = np.concatenate([subject_data[s - 1][0] for s in range(1, len(subject_data) + 1)], axis=0)
     y_all = np.concatenate([subject_data[s - 1][1] for s in range(1, len(subject_data) + 1)], axis=0)
     sub_all = np.concatenate([np.full(len(subject_data[s - 1][1]), s - 1, dtype=np.int64)
                               for s in range(1, len(subject_data) + 1)], axis=0)
-    # 混合训练/验证（全部被试拼接 0.6/0.2/0.2，train 用前两者）；
-    # others=sub_all 让试次归属随 X/y 同步切分（per-subject conv1 路由用）
-    cross = split_train_valid_test(X_all, y_all, others=[sub_all])
+    # samepool 是主协议：全池拼接后按类别分层随机 70/15/15；原 A0T/A0E
+    # 不再决定边界。cross_session 仅保留为 session 偏移诊断。
+    # others=sub_all 仅随 X/y 同步切分，供梯度分组和逐被试诊断使用。
+    if SPLIT == 'cross_session':
+        # session 标签必须逐被试算再拼接: y_all 上同类索引横跨全部被试
+        sess_all = np.concatenate([_session_index(subject_data[s - 1][1])
+                                   for s in range(1, len(subject_data) + 1)])
+        cross = split_by_session(X_all, y_all, sess_all, others=[sub_all])
+        n_sub_te = len(np.unique(cross[8]))
+        if n_sub_te != len(subject_data):
+            raise RuntimeError(
+                f'测试集只覆盖 {n_sub_te}/{len(subject_data)} 个被试 — session 切分有误')
+    else:
+        cross = split_train_valid_test(X_all, y_all, train_ratio=0.70,
+                                       valid_ratio=0.15, random_state=42,
+                                       others=[sub_all])
+    print(f'[cross_mix 切分/{SPLIT}] train {len(cross[1])} / valid {len(cross[3])} / '
+          f'test {len(cross[5])} 试次, 测试集覆盖 {len(np.unique(cross[8]))} 个被试'
+          + (', 全部来自 session1' if SPLIT == 'cross_session' else ', 全部公开 trial 随机分层'))
     return subject_data, T, M, splits, cross
 
 
@@ -348,9 +411,7 @@ def grad_conflict_probe(net, probe):
     vecs = []
     for sid in sorted(probe):
         xb, yb = probe[sid]
-        sb = (torch.full((len(yb),), sid, dtype=torch.long, device=DEVICE)
-              if (PER_SUBJECT_CONV1 > 0 or PER_SUBJECT_CONV2 > 0) else None)
-        loss = nn.CrossEntropyLoss()(net(xb, sb) if sb is not None else net(xb), yb)
+        loss = nn.CrossEntropyLoss()(net(xb), yb)
         grads = torch.autograd.grad(loss, params, allow_unused=True)
         vecs.append(torch.cat([
             (g if g is not None else torch.zeros_like(p)).reshape(-1)
@@ -404,9 +465,8 @@ def feature_snapshot(net, loader, M):
     with torch.no_grad():
         for batch in loader:
             xb = batch[0].to(DEVICE)
-            sb = batch[2].to(DEVICE) if len(batch) > 2 and (PER_SUBJECT_CONV1 > 0 or PER_SUBJECT_CONV2 > 0) else None
             recorder.clear()
-            net(xb, sb) if sb is not None else net(xb)
+            net(xb)
             labels.append(batch[1].numpy())
             if len(batch) > 2:
                 sub_ids.append(batch[2].numpy())
@@ -475,8 +535,7 @@ def accuracy(net, loader):
     with torch.no_grad():
         for batch in loader:
             xb, yb = batch[0].to(DEVICE), batch[1].to(DEVICE)
-            sb = batch[2].to(DEVICE) if len(batch) > 2 and (PER_SUBJECT_CONV1 > 0 or PER_SUBJECT_CONV2 > 0) else None
-            out = net(xb, sb) if sb is not None else net(xb)
+            out = net(xb)
             correct += (out.argmax(1) == yb).sum().item()
             total += len(yb)
     return correct / max(total, 1)
@@ -531,8 +590,7 @@ def per_class_acc_conf(net, loader, n_classes=N_CLASSES):
     with torch.no_grad():
         for batch in loader:
             xb, yb = batch[0].to(DEVICE), batch[1].to(DEVICE)
-            sb = batch[2].to(DEVICE) if len(batch) > 2 and (PER_SUBJECT_CONV1 > 0 or PER_SUBJECT_CONV2 > 0) else None
-            pred = (net(xb, sb) if sb is not None else net(xb)).argmax(1).cpu().numpy()
+            pred = net(xb).argmax(1).cpu().numpy()
             for i, j in zip(yb.cpu().numpy(), pred):
                 conf[i, j] += 1
     acc = conf.diagonal() / conf.sum(axis=1).clip(1)
@@ -550,17 +608,6 @@ def conv1_ortho_penalty(net, lam):
     """
     if lam <= 0:
         return 0.0
-    if isinstance(net.conv1, _PerSubjectConv2d):
-        # per-subject：对各组分别正则（正交约束定义在各组内部）
-        w = net.conv1.weight   # (N, c1_out, 1, 22, 1)
-        w = w.reshape(w.shape[0], w.shape[1], -1)
-        g = w @ w.transpose(-1, -2)          # (N, c1_out, c1_out)
-        eye = torch.eye(g.shape[-1], device=g.device)
-        tot = 0.0
-        for s in range(w.shape[0]):
-            gs = g[s]
-            tot = tot + ((gs - eye) ** 2).sum()
-        return 0.5 * lam * tot
     w = net.conv1.weight
     w = w.view(w.shape[0], -1)               # (n_sp, 22)
     g = w @ w.t()                            # (n_sp, n_sp)
@@ -580,14 +627,9 @@ def _infer_windows(net, tr_ld):
             probe_b = batch[0].to(DEVICE)
             break
         x = net.channel_weight(probe_b) if net.channel_weight is not None else probe_b
-        # conv1: 共享或 per-subject（conv1 为 (22,1) 空间核，不改变时序长度，
-        # 窗口数与 per-subject 路由无关；per-subject 用第 0 组即可探测）
-        x = net.conv1(x, torch.zeros(x.shape[0], dtype=torch.long, device=DEVICE)) \
-            if isinstance(net.conv1, _PerSubjectConv2d) else net.conv1(x)
+        x = net.conv1(x)
         x = net.In1(x)
-        # conv2: 同样探测；per-subject 用第 0 组（时序长度仅由核长/填充决定）
-        x = net.conv2(x, torch.zeros(x.shape[0], dtype=torch.long, device=DEVICE)) \
-            if isinstance(net.conv2, _PerSubjectConv2dTemporal) else net.conv2(x)
+        x = net.conv2(x)
         x = net.In2(x)
         spd = net.ract1(x); spd = net.spdnorm(spd)
         _, shape = net.att2(spd)
@@ -661,7 +703,8 @@ def train_with_record(tag, net, tr_ld, va_ld, te_ld, M, ckpt_prefix,
     opt = MixOptimizer(base_opt)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(base_opt, T_max=ITERATIONS)
 
-    rec = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': [],
+    rec = {'n_windows': M,
+           'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': [],
            'test_acc': [], 'lr': [], 'grad': [], 'params': [], 'features': [],
            'attn_conc': [], 'silhouette': [], 'test_iter': [], 'snap_iter': [],
            'per_class_test': [], 'confusion': [],
@@ -673,9 +716,8 @@ def train_with_record(tag, net, tr_ld, va_ld, te_ld, M, ckpt_prefix,
         loss_sum = acc_tr = n_tr = nb = 0
         for batch in tr_ld:
             xb, yb = batch[0].to(DEVICE), batch[1].to(DEVICE)
-            sb = batch[2].to(DEVICE) if len(batch) > 2 and (PER_SUBJECT_CONV1 > 0 or PER_SUBJECT_CONV2 > 0) else None
             n_tr += len(yb)
-            out = net(xb, sb) if sb is not None else net(xb)
+            out = net(xb)
             loss = CE(out, yb) + conv1_ortho_penalty(net, ortho_lambda)
             opt.zero_grad()
             loss.backward()
@@ -699,9 +741,8 @@ def train_with_record(tag, net, tr_ld, va_ld, te_ld, M, ckpt_prefix,
         with torch.no_grad():
             for batch in va_ld:
                 xb, yb = batch[0].to(DEVICE), batch[1].to(DEVICE)
-                sb = batch[2].to(DEVICE) if len(batch) > 2 and (PER_SUBJECT_CONV1 > 0 or PER_SUBJECT_CONV2 > 0) else None
                 vn += len(yb)
-                out = net(xb, sb) if sb is not None else net(xb)
+                out = net(xb)
                 vloss += CE(out, yb).item()
                 vacc += (out.argmax(1) == yb).sum().item()
         rec['train_loss'].append(loss_sum / max(nb, 1))
@@ -769,13 +810,11 @@ def main():
     print(f'T={T}, n_windows M={M}, 混合被试数={len(subject_data)}')
 
     results = {'config': {'subjects': PAIR_SUBJECTS, 'iterations': ITERATIONS,
-                          'lr': LR, 'wd': WD, 'n_windows': M}, 'models': {}}
+                          'lr': LR, 'wd': WD, 'input_windows_before_conv2': M,
+                          'split': SPLIT}, 'models': {}}
 
-    def _make_net(p1=PER_SUBJECT_CONV1, p2=PER_SUBJECT_CONV2):
-        """统一经 build_matt_model 构建(参数齐全,dropout 走构造传入)
-
-        p1/p2: 该模型 conv1/conv2 是否逐被试独立（被试内=0 共享，混合=对应开关）
-        """
+    def _make_net():
+        """统一经 build_matt_model 构建；模型只接收 EEG，不接收被试身份。"""
         return build_matt_model(WIN_SAMPLES, STEP_SAMPLES, {
             'n_classes': N_CLASSES,
             'd_attn_in': D_ATTN_IN,
@@ -795,8 +834,6 @@ def main():
             'attn_prior': ATTN_PRIOR,
             'manifold_change': MANIFOLD_CHANGE,
             'dropout': DROP_PROB,
-            'per_subject_conv1': p1,
-            'per_subject_conv2': p2,
             'norm_type': NORM_TYPE,
         })
 
@@ -804,7 +841,7 @@ def main():
     for sid in ([] if SKIP_WITHIN else PAIR_SUBJECTS):
         X_tr, y_tr, X_va, y_va, X_te, y_te = splits[sid]
         tr_ld, va_ld, te_ld = make_loaders(X_tr, y_tr, X_va, y_va, X_te, y_te)
-        net = _make_net(0, 0)   # 被试内：共享 conv1/conv2，无塌缩且无需 per-subject 路由
+        net = _make_net()
         if LOAD_BACKEND_PATH:
             load_backend_state(net, LOAD_BACKEND_PATH, freeze=FREEZE_BACKEND)
         _prior = (net.channel_weight.scale.detach().clone() if
@@ -816,11 +853,9 @@ def main():
         del net
 
     # 9人混合
-    # cross_split 现在含 sub_id（6 元 + sub 的 train/valid/test 3 份）
+    # cross_split 含 trial 所属被试索引（6 元 + 3 份索引），仅供梯度分组与
+    # 逐被试诊断；模型前向、梯度更新与损失均不接收该索引。
     X_tr, y_tr, X_va, y_va, X_te, y_te, s_tr, s_va, s_te = cross_split
-    # 混合分支一律携带被试归属：per-subject conv 用它路由，梯度探针与
-    # subject-silhouette 也用它；共享 conv 时训练循环仍取 sb=None
-    # （判据是 PER_SUBJECT_* 开关），数值与旧行为等价。
     tr_ld, va_ld, te_ld = make_loaders(X_tr, y_tr, X_va, y_va, X_te, y_te,
                                        s_tr=s_tr, s_va=s_va, s_te=s_te)
     net = _make_net()
@@ -839,32 +874,7 @@ def main():
                             save_backend_on_best=bool(SAVE_BACKEND_PATH),
                             probe=_probe)
 
-    # per-subject 身份捷径检验：把测试集中每个试次的路由 sub_id 整体错配
-    # （+1 mod N），看 acc 是否断崖 —— 若断崖说明 W_s 只编码被试身份而非
-    # 空间特征；若几乎不变说明学到的是共享可迁移的空间投影
-    if (PER_SUBJECT_CONV1 > 0 or PER_SUBJECT_CONV2 > 0) and \
-        (isinstance(net.conv1, _PerSubjectConv2d) or isinstance(net.conv2, _PerSubjectConv2dTemporal)):
-        perm_correct = 0
-        perm_wrong = 0
-        n_te = 0
-        net.eval()
-        with torch.no_grad():
-            for batch in te_ld:
-                xb, yb = batch[0].to(DEVICE), batch[1].to(DEVICE)
-                sb = batch[2].to(DEVICE)
-                sb_wrong = (sb + 1) % PER_SUBJECT_CONV1
-                out_c = net(xb, sb)
-                out_w = net(xb, sb_wrong)
-                perm_correct += (out_c.argmax(1) == yb).sum().item()
-                perm_wrong += (out_w.argmax(1) == yb).sum().item()
-                n_te += len(yb)
-        print(f'   [身份置换] 正确路由 acc={(perm_correct/n_te)*100:.2f}% | '
-              f'错配(+1 mod N) acc={(perm_wrong/n_te)*100:.2f}% | Δ={((perm_correct-perm_wrong)/n_te)*100:.2f}pp')
-        rec['identity_perm_test'] = {
-            'correct_route_acc': perm_correct / n_te,
-            'wrong_route_acc': perm_wrong / n_te,
-            'acc_delta': (perm_correct - perm_wrong) / n_te,
-        }
+
     results['models']['cross_mix'] = {'tag': '全量混合跨被试', **rec}
 
     # 保存

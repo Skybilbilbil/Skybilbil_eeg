@@ -347,8 +347,6 @@ def build_matt_model(win_samples, step_samples, args):
         attn_prior=args.get('attn_prior', None),
         manifold_change=args.get('manifold_change', None),
         dropout=args.get('dropout', 0.3),
-        per_subject_conv1=args.get('per_subject_conv1', 0),
-        per_subject_conv2=args.get('per_subject_conv2', 0),
         norm_type=args.get('norm_type', 'in'),
     )
     if torch.cuda.is_available():

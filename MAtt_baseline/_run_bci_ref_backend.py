@@ -72,7 +72,7 @@ def train_ref(sid):
         'conv2_ms_per_branch': None, 'conv2_ms_specs': None,
         'n_spatial_filters': 22, 'channel_gaussian': False, 'gaussian_sigma': 0.62,
         'attn_change': None, 'attn_prior': None, 'manifold_change': None,
-        'dropout': TP.DROP_PROB, 'per_subject_conv1': 0, 'per_subject_conv2': 0})
+        'dropout': TP.DROP_PROB})
     TP.train_with_record(f"S{sid} 参考被试后端", net, tr_ld, va_ld, te_ld, M,
                          f"ref_s{sid}", save_backend_on_best=True)
     print(f"[参考] S{sid} 后端已存 → {bk_path}")

@@ -59,9 +59,9 @@ def split_train_valid_test(X, y, train_ratio=0.6, valid_ratio=0.2, random_state=
     分层划分 train / valid / test
 
     others: 可选 [数组, ...]，必须与 X 第 0 维等长。返回时按同样的切分索引
-    一并划分，用于携带试次级元数据（如被试归属 sub_id，供 per-subject conv1
-    路由）。返回格式: X_train,y_train,X_valid,y_valid,X_test,y_test 后紧跟
-    others 中各数组的 (train, valid, test) 三份（按传入顺序）。
+    一并划分，用于携带试次级元数据（如被试归属，供梯度分组或逐被试诊断）。
+    返回格式: X_train,y_train,X_valid,y_valid,X_test,y_test 后紧跟 others 中各数组的
+    (train, valid, test) 三份（按传入顺序）。
     """
     parts = [X] + (list(others) if others else [])
     outs = train_test_split(

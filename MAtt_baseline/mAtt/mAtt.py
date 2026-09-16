@@ -6,83 +6,6 @@ import torch.nn.functional as F
 from mAtt.spd import SPDTransform, SPDTangentSpace, SPDRectified, SPDNorm
 
 
-class _PerSubjectConv2d(nn.Module):
-    """逐被试独立空间滤波器组
-
-    每个被试（sub_id 0..N-1）拥有一组独立的 (c1_out, 1, 22, 1) 空间卷积权重，
-    forward 时按 batch 内每个样本的被试归属路由到对应滤波器组。
-    数学动机：跨被试 conv1 塌缩源于"共享一个 W 无法同时拟合 9 个近乎正交的
-    空间方向（子空间平均角 60.4°）→ 梯度互斥 → wd 指数压缩"。per-subject 把
-    梯度隔离到各自滤波器（𝔼[∂L/∂W_s] 不再互斥），检验"空间滤波本身是否能
-    以逐被试形式应对通道差异"。
-    ⚠ 代价：identity shortcut 风险 —— 每个 W_s 可能退化成编码"被试身份"而
-    非空间特征；用 wrong-sub 测试（路由给别的被试滤波器看 acc 是否断崖）检验。
-    """
-
-    def __init__(self, n_subjects, out_channels, kernel=22):
-        super().__init__()
-        self.n_subjects = n_subjects
-        self.weight = nn.Parameter(torch.empty(n_subjects, out_channels, 1, kernel, 1))
-        self.bias = nn.Parameter(torch.zeros(n_subjects, out_channels))
-        # 每个滤波器组按 nn.Conv2d 默认方式独立初始化
-        for s in range(n_subjects):
-            nn.init.kaiming_uniform_(self.weight[s], a=math.sqrt(5))
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight[s])
-            bound = 1 / math.sqrt(fan_in)
-            nn.init.uniform_(self.bias[s], -bound, bound)
-
-    def forward(self, x, sub_ids):
-        # x: (B,1,22,T); sub_ids: (B,) int∈[0,n_subjects)
-        # 空间核 (1,22,1) 沿通道维全连接,逐样本不同核 → 用 gather 取出每样本所属
-        # 被试权重后以一次 einsum 完成全部样本,替代 for s in range(N) 的逐组
-        # kernel 调用(103 组小 conv 的 kernel 启动开销是跨被试训练的主耗时)。
-        # out[b,o,t] = Σ_c W[b][o,c]·x[b,c,t] + bias[b][o]  ← 对应线性层公式 W·x+b
-        wb = self.weight[sub_ids]               # (B, Co,1,22,1) → squeeze 轴2/4
-        wb = wb.squeeze(2).squeeze(3)           # (B, Co, 22)
-        bb = self.bias[sub_ids]                 # (B, Co)
-        xb = x.squeeze(1)                       # (B, 22, T)
-        return torch.einsum('bct,boc->bot', xb, wb).unsqueeze(2) + bb[:, :, None, None]
-        # 注:unsqueeze(2) 得 (B, Co, 1, T),与逐组 F.conv2d 输出布局一致(无 padding)
-
-
-class _PerSubjectConv2dTemporal(nn.Module):
-    """逐被试独立时序（频率）滤波器组
-
-    与 _PerSubjectConv2d 同构，作用于 conv2：每个被试一组独立的
-    (c_out, c_in, 1, k) 时序卷积核，forward 按 batch 内 sub_id 路由。
-    数学动机：conv2 塌缩源于 μ 峰频率个体漂移（7.8-11.7Hz）导致共享
-    卷积核的梯度互斥；per-subject 把梯度隔离到各自频率滤波器。
-    """
-
-    def __init__(self, n_subjects, in_channels, out_channels, kernel=12, padding=6):
-        super().__init__()
-        self.n_subjects = n_subjects
-        self.padding = (0, padding)
-        self.weight = nn.Parameter(torch.empty(n_subjects, out_channels, in_channels, 1, kernel))
-        self.bias = nn.Parameter(torch.zeros(n_subjects, out_channels))
-        for s in range(n_subjects):
-            nn.init.kaiming_uniform_(self.weight[s], a=math.sqrt(5))
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight[s])
-            bound = 1 / math.sqrt(fan_in)
-            nn.init.uniform_(self.bias[s], -bound, bound)
-
-    def forward(self, x, sub_ids):
-        # x: (B, C_in, 1, T); sub_ids: (B,)
-        # 一维时序核 (1,K),pad 每边 K//2=6 → 输出长 T+1。逐样本不同核,
-        # 同样用 gather + 固定 K 次 einsum 完成,替代 for s in range(N) 逐组调用。
-        # out[b,o,t] = Σ_{c,k} w[b,o,c,k]·x_pad[b,c,t+k]  ← F.conv2d 卷积定义
-        K = self.weight.shape[-1]
-        pad = int(self.padding[1])                # (0,6) → 时间维每边 6
-        xb = x.squeeze(2)                         # (B, C_in, T)
-        xp = F.pad(xb, (pad, pad))                # (B, C_in, T+2·pad)
-        L = xb.shape[-1] + 1                      # 输出长 = T+1 (与 F.conv2d 一致)
-        wb = self.weight[sub_ids].squeeze(3)      # (B, Co, C_in, K)
-        bb = self.bias[sub_ids]                   # (B, Co)
-        out = torch.einsum('bct,boc->bot', xp[:, :, :L], wb[:, :, :, 0])
-        for k in range(1, K):
-            out = out + torch.einsum('bct,boc->bot', xp[:, :, k:k + L], wb[:, :, :, k])
-        return out.unsqueeze(2) + bb[:, :, None, None]
-
 
 class _Conv2dTemporalSeparable(nn.Module):
     """时序深度可分离卷积: depthwise(1×k, groups=C) + pointwise(1×1)
@@ -706,8 +629,7 @@ class _SparseAttentionBase(nn.Module):
                  conv2_separable=False, conv2_multiscale=False,
                  conv2_ms_per_branch=None, conv2_ms_specs=None,
                  manifold_change=None, attn_change=None, attn_prior=None,
-                 dropout=0.3, score_original=True, per_subject_conv1=0,
-                 per_subject_conv2=0, norm_type='in'):
+                 dropout=0.3, score_original=True, norm_type='in'):
         super().__init__()
         c1_out = int(n_spatial_filters) if conv1_out is None else int(conv1_out)
         c2_out = int(d_attn_in) if conv2_out is None else int(conv2_out)
@@ -715,16 +637,12 @@ class _SparseAttentionBase(nn.Module):
         self.channel_weight = (ChannelPriorWeighting(
             BCI2A_CHANNELS, gaussian=channel_gaussian, gaussian_sigma=gaussian_sigma)
             if use_channel_weight else None)
-        # FE: 空间滤波（conv1），将 22 通道压缩成 c1_out 个空间分量
-        # per_subject_conv1>1 时改为逐被试独立滤波器组（梯度隔离，检验空间域自适应）
+        # FE: 共享空间滤波，将 22 通道压缩成 c1_out 个空间分量。
+        # 主协议不向模型提供被试身份，故所有试次使用同一组卷积核。
         self.n_spatial_filters = c1_out
-        if int(per_subject_conv1) > 1:
-            self.conv1 = _PerSubjectConv2d(int(per_subject_conv1), c1_out, kernel=conv1_kernel)
-        else:
-            self.conv1 = nn.Conv2d(1, c1_out, (conv1_kernel, 1))
+        self.conv1 = nn.Conv2d(1, c1_out, (conv1_kernel, 1))
         self.In1 = _norm_layer(norm_type)(c1_out, affine=True)   # A8: IN(默认) 或 BN
         # conv2 实现：全连接时序卷积 / 深度可分离 / 多尺度并联滤波器组
-        # per_subject_conv2>1：每被试独立时序滤波（仅作用于全连接路径）
         if conv2_multiscale:
             self.conv2 = _Conv2dTemporalMultiScale(
                 c1_out, c2_out,
@@ -734,10 +652,6 @@ class _SparseAttentionBase(nn.Module):
         elif conv2_separable:
             self.conv2 = _Conv2dTemporalSeparable(
                 c1_out, c2_out, kernel_size=conv2_kernel, padding=conv2_pad)
-        elif int(per_subject_conv2) > 1:
-            self.conv2 = _PerSubjectConv2dTemporal(
-                int(per_subject_conv2), c1_out, c2_out,
-                kernel=conv2_kernel, padding=conv2_pad)
         else:
             self.conv2 = nn.Conv2d(c1_out, c2_out, (1, conv2_kernel),
                                    padding=(0, conv2_pad))
@@ -765,29 +679,27 @@ class _SparseAttentionBase(nn.Module):
         else:
             self.linear = nn.Linear(n_windows * self.feat_per_window, n_classes, bias=True)
 
-    def _shared_backbone(self, x, sub_ids=None):
+    def _shared_backbone(self, x):
         if self.channel_weight is not None:
             x = self.channel_weight(x)
-        # per-subject conv1：sub_ids 逐样本路由到对应滤波器组；共享 conv1 忽略
-        x = self.conv1(x, sub_ids) if isinstance(self.conv1, _PerSubjectConv2d) else self.conv1(x)
+        x = self.conv1(x)
         x = self.In1(x)
-        # per-subject conv2：同样按 sub_ids 路由；共享 conv2 忽略
-        x = self.conv2(x, sub_ids) if isinstance(self.conv2, _PerSubjectConv2dTemporal) else self.conv2(x)
+        x = self.conv2(x)
         x = self.In2(x)
         spd = self.ract1(x)                     # (B,M,C,C)
         spd = self.spdnorm(spd)                 # A12
         spd = self.manifold_change(spd)         # 变化特征（None=恒等）
         return spd
 
-    def _features(self, x, sub_ids=None):
-        spd = self._shared_backbone(x, sub_ids)
+    def _features(self, x):
+        spd = self._shared_backbone(x)
         x, shape = self.att2(spd)
         x = self.ract2(x)
         x = self.tangent(x)
         return self.flat(x.view(shape[0], shape[1], -1))
 
-    def forward(self, x, sub_ids=None):
-        x = self._features(x, sub_ids)
+    def forward(self, x):
+        x = self._features(x)
         if self.dropout is not None:
             x = self.dropout(x)
         return self.linear(x)
@@ -810,7 +722,7 @@ class mAtt_bci(_SparseAttentionBase):
                  n_spatial_filters=22, channel_gaussian=False,
                  gaussian_sigma=0.62, attn_change=None,
                  attn_prior=None, manifold_change=None, dropout=0.3,
-                 per_subject_conv1=0, per_subject_conv2=0, norm_type='in'):
+                 norm_type='in'):
         super().__init__(
             win_samples, step_samples,
             n_classes=n_classes, d_attn_in=d_attn_in, d_attn_out=d_attn_out,
@@ -824,11 +736,9 @@ class mAtt_bci(_SparseAttentionBase):
             conv2_ms_per_branch=conv2_ms_per_branch, conv2_ms_specs=conv2_ms_specs,
             manifold_change=manifold_change, attn_change=attn_change,
             attn_prior=attn_prior, dropout=dropout,
-            per_subject_conv1=per_subject_conv1,
-            per_subject_conv2=per_subject_conv2,
             norm_type=norm_type,
         )
 
-    def get_features(self, x, sub_ids=None):
+    def get_features(self, x):
         """分类头之前的特征（与 forward 共享主干，用于 silhouette 等）"""
-        return self._features(x, sub_ids)
+        return self._features(x)
