@@ -348,6 +348,8 @@ def build_matt_model(win_samples, step_samples, args):
         manifold_change=args.get('manifold_change', None),
         dropout=args.get('dropout', 0.3),
         norm_type=args.get('norm_type', 'in'),
+        raw_cov_stream=args.get('raw_cov_stream', False),
+        n_charts=args.get('n_charts', 0),
     )
     if torch.cuda.is_available():
         net = net.cuda()

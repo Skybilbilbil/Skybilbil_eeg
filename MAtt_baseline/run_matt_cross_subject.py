@@ -4,6 +4,10 @@ MAtt 跨被试泛化实验入口（滑动时间窗 + 稀疏流形注意力版）
 
 - 90 个 seen subjects：用于训练，每个被试留一部分做被试内测试
 - 13 个 unseen subjects：完全跨被试测试
+
+⚠ 口径（2026-10-30）：本脚本仍用数据集原始采样率 + 全连接 conv2，与
+   train_pair_with_recording.py 的新默认（62.5 Hz + 深度可分离）不同；
+   且 LOSO/留出被试口径已于 2026-09-19 退出报数。
 """
 
 import sys
@@ -17,7 +21,7 @@ from utils.functions import (
     trainNetwork, testNetwork, save_visualization_data, resolve_path,
     build_matt_model, load_matt_model,
 )
-from utils.GetPhysionetMI import getCrossSubjectDataloader
+from utils.dataset import getCrossSubjectDataloader
 
 
 # ============================================================

@@ -1,13 +1,13 @@
 # 数据/输出目录（大体积，不推 GitHub）
 saved_data/
-results/
-trajectory_data/
-CSV files/
-C-/
-D-/
-figures/
 MAtt_baseline/results/
-pretest/output/
+MAtt_baseline/mAtt/geometry_figs/
+MAtt_baseline/mAtt/math_figs/
+
+# 文字材料一律不进版本库（2026-10-15 用户决定）。
+# 原「Word 交付物进版本库」例外块（2026-10-05 加）同日撤销：两份 docx 已 git rm --cached，
+# 文件仍在工作区，只是不再被跟踪。
+*.docx
 
 # Python 缓存
 __pycache__/
@@ -22,3 +22,4 @@ __pycache__/
 *.tmp
 .dsh/
 .omo/
+.zcode/

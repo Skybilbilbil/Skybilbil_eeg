@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 MAtt 在 PhysionetMI 预处理数据上的运行脚本（滑动时间窗 + 稀疏流形注意力版）
+
+⚠ 口径（2026-10-30）：本脚本仍用数据集原始采样率（250/160 Hz）+ 全连接 conv2，
+   与 train_pair_with_recording.py 的新默认（62.5 Hz + 深度可分离）不同。
+   跨脚本比较读数之前先确认口径。
 """
 
 import json
@@ -11,7 +15,7 @@ from utils.functions import (
     trainNetwork, testNetwork, save_visualization_data, resolve_path,
     build_matt_model, load_matt_model,
 )
-from utils.GetPhysionetMI import getAllDataloader
+from utils.dataset import getAllDataloader
 
 
 # ============================================================
@@ -39,7 +43,7 @@ CONFIG = {
     'n_heads': 1,              # 注意力头数；>1 时 K/V 单组共享（GQA）
     'dropout': 0.3,            # dropout 概率（0.3 平衡正则与效果）
 
-    'model_path': './results/checkpoint/',
+    'model_path': './results/run_matt_physionetmi/',   # 本脚本独占的输出目录（不再与他人共用 results/checkpoint/）
     'data_path': None,         # None 时根据 dataset 自动选择默认路径
 }
 

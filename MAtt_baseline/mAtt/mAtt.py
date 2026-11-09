@@ -145,7 +145,7 @@ class ChannelPriorWeighting(nn.Module):
     - gaussian=True 时改为固定生理学先验掩膜（PHYSIO_CHANNEL_PRIOR，不参与训练），
       以 C3/Cz/C4 运动带为主峰、SMA 次峰、颞区压低，强制网络聚焦中央区，
       避免跨被试时通过"关闭通道"（scale→0）逃避空间变异；
-    - 假设数据通道顺序与 BCI2A_CHANNELS 一致（GetPhysionetMI 已校验通道名集合）。
+    - 假设数据通道顺序与 BCI2A_CHANNELS 一致（utils.dataset 已校验通道名集合）。
     """
 
     def __init__(self, channel_names=BCI2A_CHANNELS, gaussian=False,
@@ -295,8 +295,10 @@ class ManifoldChange(nn.Module):
     @staticmethod
     def _expm(y):
         y = ((y + y.transpose(-1, -2)) / 2).double()
-        s, u = torch.linalg.eigh(y)
-        return (u @ torch.diag_embed(s.exp()) @ u.transpose(-1, -2)).float()
+        # 用 matrix_exp 而非 eigh 谱指数化：le_win0 的窗 0 恒等阵使 log 差为 0，
+        # eigh 的 8 重简并特征值在反向时给出 NaN（前向正常，实测首迭代即 NaN）。
+        # matrix_exp 的 scaling-squaring 反向不经过简并特征向量，数值稳定。
+        return torch.matrix_exp(y).float()
 
     def forward(self, spd):
         if self.mode is None:
@@ -304,7 +306,10 @@ class ManifoldChange(nn.Module):
         L = self._logm(spd)                     # (B,M,d,d)
         if self.mode == 'le_win0':
             L0 = L[:, 0:1]                      # (B,1,d,d) 每样本窗0=自己的静息参考
-            Y = L - L0
+            # 数值保护：静息窗 SPD 近奇异时 log 特征值差可达 ±14，
+            # exp 后的极端值会污染下游 SPDNorm 的 EMA（实测首迭代即 NaN）。
+            # 正常 ERD 的 log 特征值差 <1，±8 的截断不影响有效样本。
+            Y = (L - L0).clamp(-8.0, 8.0)
         elif self.mode == 'le_diff1':
             Y = L[:, 1:] - L[:, :-1]
             Y = torch.cat([Y, Y[:, -1:]], dim=1)  # 保持 M 窗（末窗复制）
@@ -722,7 +727,7 @@ class mAtt_bci(_SparseAttentionBase):
                  n_spatial_filters=22, channel_gaussian=False,
                  gaussian_sigma=0.62, attn_change=None,
                  attn_prior=None, manifold_change=None, dropout=0.3,
-                 norm_type='in'):
+                 norm_type='in', raw_cov_stream=False, n_charts=0):
         super().__init__(
             win_samples, step_samples,
             n_classes=n_classes, d_attn_in=d_attn_in, d_attn_out=d_attn_out,
@@ -738,6 +743,81 @@ class mAtt_bci(_SparseAttentionBase):
             attn_prior=attn_prior, dropout=dropout,
             norm_type=norm_type,
         )
+        # 并联原始任务窗协方差切向量流(经典 Riemannian 表示,无参数;诊断见
+        # results/ceiling_decomposition/ — 任务窗协方差共享 LDA 62.9 ≫ 模型 54-57)
+        self.raw_cov_stream = bool(raw_cov_stream)
+        # 可学习多切图流:K 个可学习 SPD 参考点 R_k 的 log 切图坐标拼进特征
+        # (零训练对照线 = results/multichart_ceiling/:rand8 家族 64.8 ≫ 单切图 62.9)。
+        # 与 raw_cov_stream 互斥:两者都在分类头前拼任务窗协方差切向量,同开会重复
+        # 表示且"固定无参数流"与"梯度图内可学习流"语义冲突。
+        self.n_charts = int(n_charts)
+        assert not (self.n_charts > 0 and self.raw_cov_stream), \
+            'n_charts>0 与 raw_cov_stream=True 互斥'
+        if self.n_charts > 0:
+            # W_k 无约束(前向 R_k = W_k W_kᵀ + 1e-4·I 保证 SPD);零初始化 ⇒
+            # R_k = 1e-4·I,训练脚本在训练前用训练折协方差 Cholesky 覆盖,
+            # eval 端由 state_dict 载入。
+            self.chart_ref = nn.Parameter(torch.zeros(self.n_charts, 22, 22))
+
+    def _raw_cov_vec(self, x):
+        """原始任务窗协方差切向量(固定变换、无参数):x (B,1,22,T) → (B,253)。
+
+        窗 = 从 win_samples 起到试次末(与主协议任务窗一致);trace 归一 + log 的
+        上三角 √2 展开,与 analysis 探针(logvec)同构造。不经 channel_weight/
+        conv1/IN/conv2——经典 Riemannian 管线的表示(对角功率拓扑保留)。"""
+        with torch.no_grad():
+            x2 = x.squeeze(1).double()
+            seg = x2[:, :, self.ract1.win:]
+            seg = seg - seg.mean(-1, keepdim=True)
+            C = seg @ seg.mT / seg.shape[-1]
+            tr = torch.diagonal(C, dim1=-2, dim2=-1).sum(-1)
+            C = C * (C.shape[1] / tr[:, None, None])
+            s, u = torch.linalg.eigh(C.cpu())
+            s = s.clamp(min=1e-10)
+            L = u @ torch.diag_embed(torch.log(s)).to(u.dtype) @ u.mT
+            iu = torch.triu_indices(C.shape[1], C.shape[1])
+            v = L[:, iu[0], iu[1]].clone()
+            v[:, iu[0] != iu[1]] *= math.sqrt(2)
+            return v.float().to(x.device)
+
+    def _chart_vecs(self, x):
+        """K 个参考点的 log 切图坐标(在梯度图内,chart_ref 可学习):x (B,1,22,T) → (B, K*253)。
+
+        任务窗协方差 C 的取窗/中心化/迹归一照抄 _raw_cov_vec,但保留 float32 且
+        不进 no_grad —— 梯度要经 t_k 流回 chart_ref。对每个参考点
+          R_k = W_k W_kᵀ + 1e-4·I (SPD),  t_k = vech_sqrt2(logm(R_k^{-1/2} C R_k^{-1/2}))
+        R_k^{-1/2} 由 R_k 的 eigh 算(U f(Λ) Uᵀ),logm 由白化矩阵的 eigh(log) 算;
+        vech_sqrt2 = 上三角展开、非对角 ×√2(切向量内积 = Frobenius 内积),与
+        analyze_multichart_ceiling.spdvec 逐位一致。特征值 clamp_min(1e-5) 防 log/rsqrt
+        奇异(数学上 R_k 谱 ≥ 1e-4、C 谱 > 0,截断只兜数值下溢)。"""
+        x2 = x.squeeze(1)
+        seg = x2[:, :, self.ract1.win:]
+        seg = seg - seg.mean(-1, keepdim=True)
+        C = seg @ seg.mT / seg.shape[-1]
+        tr = torch.diagonal(C, dim1=-2, dim2=-1).sum(-1)
+        C = C * (C.shape[1] / tr[:, None, None])
+        eye = torch.eye(C.shape[1], device=C.device, dtype=C.dtype)
+        iu = torch.triu_indices(C.shape[1], C.shape[1], device=C.device)
+        mult = torch.where(iu[0] != iu[1], math.sqrt(2), 1.0).to(C.dtype)
+        outs = []
+        for k in range(self.n_charts):
+            W = self.chart_ref[k]
+            R = W @ W.T + 1e-4 * eye
+            sR, UR = torch.linalg.eigh(R)
+            Rm12 = UR @ torch.diag_embed(sR.clamp_min(1e-5).rsqrt()) @ UR.mT
+            S = Rm12 @ C @ Rm12
+            s, U = torch.linalg.eigh(S)
+            L = U @ torch.diag_embed(s.clamp_min(1e-5).log()) @ U.mT
+            outs.append(L[:, iu[0], iu[1]] * mult)
+        return torch.cat(outs, dim=1)
+
+    def _features(self, x):
+        f = super()._features(x)
+        if self.raw_cov_stream:
+            f = torch.cat([f, self._raw_cov_vec(x)], dim=1)
+        if self.n_charts > 0:
+            f = torch.cat([f, self._chart_vecs(x)], dim=1)
+        return f
 
     def get_features(self, x):
         """分类头之前的特征（与 forward 共享主干，用于 silhouette 等）"""

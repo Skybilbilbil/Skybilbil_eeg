@@ -11,8 +11,7 @@
   ⑥ 梯度诊断    : 每迭代各层梯度范数
   ⑦ 测试过程    : 每快照点 test acc / 每类 acc / 混淆矩阵
 
-全部保存到 results/profile_11/pair_training_*，不覆盖原 checkpoint。
-（profile_11 = 恢复全连接 conv2 + 保留 3 处等价优化 + 移除 log_trace 的新基线）
+全部保存到 results/<out_dir>/pair_training_*（默认 out_dir=train_pair），不覆盖原 checkpoint。
 """
 
 import sys, json, time, pickle
@@ -25,9 +24,9 @@ BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
 
 from mAtt.optimizer import MixOptimizer
-from mAtt.mAtt import BACKEND_PREFIXES
+from mAtt.mAtt import BACKEND_PREFIXES, BCI2A_CHANNELS
 from utils.functions import build_matt_model
-from analyze_cross_pipeline import (
+from analysis.analyze_cross_pipeline import (
     FeatureRecorder, batch_to_vectors, LAYER_ORDER, LAYER_DISP,
     WIN_SAMPLES, STEP_SAMPLES, DEVICE,
     load_preprocessed_dataset, split_train_valid_test, le_mean,
@@ -40,7 +39,10 @@ import argparse
 _parser = argparse.ArgumentParser()
 _parser.add_argument('--n_spatial_filters', type=int, default=22,
                      help='conv1 输出空间滤波器个数（22=基线，10/15=压缩版）')
-_parser.add_argument('--out_dir', type=str, default='profile_11', help='输出目录名')
+_parser.add_argument('--d_attn_in', type=int, default=8,
+                     help='conv2 输出通道数 = 注意力入口 SPD 维（8=基线；16/22=放宽共享降秩，'
+                          'd_attn_out 不变故切空间/分类头维度不变）')
+_parser.add_argument('--out_dir', type=str, default='train_pair', help='输出目录名（results/ 下）')
 _parser.add_argument('--tag', type=str, default='trainpair', help='checkpoint 文件名前缀')
 _parser.add_argument('--channel_gaussian', action='store_true',
                      help='通道加权改用固定 2D 高斯掩膜（C3/Cz/C4 中心，不参与训练）')
@@ -50,6 +52,16 @@ _parser.add_argument('--wd', type=float, default=0.02,
                      help='weight_decay（对 Adam 直接加进梯度；默认=0.02。0.5 已被证实为跨被试准确率塌缩主因）')
 _parser.add_argument('--seed', type=int, default=None,
                      help='随机种子（固定 run 可复现；None=不固定，用于多种子统计）')
+_parser.add_argument('--sample_ratio', type=float, default=1.0,
+                     help='每被试保留比例(分层抽样,默认 1.0)。用于小样本对比,'
+                          '如 0.5=每类只留一半试次;train/val/test 同步缩小')
+_parser.add_argument('--no_conv2_separable', dest='conv2_separable', action='store_false',
+                     help='回退到全连接 conv2。2026-10-30 起默认=深度可分离(dw 1×12 + pw 1×1):'
+                          '参数 -78%%、乘加 -79%%、3 seed 实测 -0.77pp(不显著)')
+_parser.add_argument('--resample_hz', type=float, default=62.5,
+                     help='重采样后采样率(须整除原 fs)。2026-10-30 起默认 62.5Hz:'
+                          '12 抽头=192ms、时间-带宽积 4.2,且前端算力降到 8.6%%。'
+                          '传 250 即关闭重采样(复现旧结果必须显式传 250)')
 _parser.add_argument('--conv2_multiscale', action='store_true',
                      help='将 Conv2 替换为多尺度并联时间滤波器组(1×8/1×16/1×32/空洞1×16)')
 _parser.add_argument('--conv2_ms_per_branch', type=int, default=None,
@@ -76,6 +88,53 @@ _parser.add_argument('--split', type=str, default='samepool',
                      choices=['samepool', 'cross_session'],
                      help='主协议 samepool(默认)=全部公开 trial 按类别分层随机 70/15/15 切分；'
                           '模型不接收 subject_id。cross_session 仅保留为 session 偏移诊断。')
+_parser.add_argument('--data_path', type=str, default=None,
+                     help='覆盖 pkl 路径(默认按 --dataset 选 saved_data 里那两份)。'
+                          '用于评测「换一份预处理后的数据」的对照')
+_parser.add_argument('--input_align', type=str, default='ea', choices=['ea', 'raw'],
+                     help='输入对齐开关: ea=现行 pkl(逐被试 EA) | raw=用 P^{-1} 还原的非 EA 输入。'
+                          '两臂只差一个对齐算子, 用于 EA 对非 EA 的配对消融。')
+_parser.add_argument('--mirror_aug', action='store_true',
+                     help='镜像翻转增广(仅 bci2a/samepool):训练折逐试次复制一份,左右半球'
+                          '同源通道互换+左手<->右手标签互换(脚/舌标签与中线通道不动)。'
+                          '把共享的镜像解剖结构作为等变约束写进训练;验证/测试不动。')
+_parser.add_argument('--proto_align', type=int, default=0,
+                     help='原型对齐(I-5,整改方案§4.2):训练折逐试次整段协方差做 LE 度量 '
+                          'K-means 得 K 个 SPD 原型;train/val/test 每试次按最近原型路由,'
+                          'X <- P_k^{-1/2} X(逐试次、标签自由、不接收 subject_id)。'
+                          '与 --mirror_aug 互斥。0=关闭。')
+_parser.add_argument('--conv1_identity', action='store_true',
+                     help='conv1 冻结为恒等(权重=单位阵、偏置=0、不训练):不学空间混合,'
+                          '下游在电极原空间读。动机=conv1 机制分析:学到的共享空间滤波把'
+                          '镜像对称+中线子空间压进病态尾部(cond≈1e3),删掉低四人'
+                          '「手 vs 非手」边界的唯一载体(results/conv1_mechanism/)。')
+_parser.add_argument('--channel_weight_identity', action='store_true',
+                     help='解剖先验通道加权冻结为全 1(fixed_mask 与 scale 全置 1、不训练):'
+                          '不删通道、不畸变增益。动机=机制修正:P1/Pz/P2/POz 被先验硬删+增益'
+                          '压到 0.3-0.64,恒等对照测得 channel_weight 对低四「手-非手」共享'
+                          '可读性 −5.6pp(results/hand_shared_trace/)。')
+_parser.add_argument('--raw_cov_stream', action='store_true',
+                     help='并联原始任务窗协方差切向量流(22×22 trace 归一 log 上三角展开,'
+                          '253 维,固定无参数,不经通道先验/conv/IN):经典 Riemannian 表示与'
+                          '深度流在分类头前拼接。动机=results/ceiling_decomposition/:'
+                          '任务窗协方差共享 LDA 62.9(低四 49.1)≫ 模型 54–57。')
+_parser.add_argument('--n_charts', type=int, default=0,
+                     help='可学习多切图流参考点数 K(0=关闭;与 --raw_cov_stream 互斥):'
+                          'K 个可学习 SPD 参考点 R_k=W_k W_kᵀ+1e-4·I 的 log 切图坐标'
+                          '(每点 253 维)拼进分类头前特征。训练前用训练折协方差 Cholesky '
+                          '初始化(仅训练折、seed 抽样);默认可学习,--chart_freeze 冻结为固定臂。'
+                          '零训练对照=results/multichart_ceiling/ rand8 家族 64.8。')
+_parser.add_argument('--chart_freeze', action='store_true',
+                     help='(需 --n_charts>0)固定切图臂:chart_ref 冻结为初始训练折协方差,'
+                          '不参与训练;默认(不加本开关)为可学习臂。')
+_parser.add_argument('--init_from', type=str, default=None,
+                     help='训练前加载完整模型 state_dict(配合 --head_only 实现'
+                          '「冻结已训练后端、只重训头」;须与来源 ckpt 架构一致)。')
+_parser.add_argument('--head_only', action='store_true',
+                     help='冻结除 linear 外全部参数,只训分类头(配合 --raw_cov_stream 用于'
+                          '「SGD 头 vs 闭式 LDA 头」对照:同特征上 SGD+CE+选模能到多少)。')
+_parser.add_argument('--dropout', type=float, default=0.3,
+                     help='dropout 概率(默认 0.3;head_only 对照可设 0)。')
 _parser.add_argument('--save_backend', type=str, default=None,
                      help='训练完成后把"后端统一模型"权重(=E2R之后 att2/ract2/tangent/flat/'
                           'dropout/linear/spdnorm/manifold_change 可学习层)单独保存到该路径,'
@@ -115,6 +174,9 @@ _parser.add_argument('--bn_recalib', action='store_true',
                           '试次,不改任何权重),再在该被试上评估 —— 即"BN trick"的可部署版本')
 _parser.add_argument('--max_subjects', type=int, default=0,
                      help='只用前 N 个被试(0=全部),用于 N-标度律实验')
+_parser.add_argument('--subjects', type=str, default='',
+                     help='仅用指定被试进行 cross_mix 子集实验(逗号分隔,1-based);'
+                          '在全体数据固定 70/15/15 切分后筛选,空=全部')
 _args = _parser.parse_args()
 N_SPATIAL_FILTERS = _args.n_spatial_filters
 TAG = _args.tag
@@ -138,6 +200,7 @@ SAVE_BACKEND_PATH = _args.save_backend
 LOAD_BACKEND_PATH = _args.load_backend
 FREEZE_BACKEND = _args.freeze_backend
 ITERATIONS = _args.iterations
+SAMPLE_RATIO = _args.sample_ratio
 BS = _args.batch_size
 SNAP_EVERY = _args.snap_every
 SIL_MAX = _args.sil_max
@@ -145,7 +208,29 @@ GRAD_PROBE = _args.grad_probe
 PROBE_PER_SUBJECT = _args.probe_per_subject
 SKIP_WITHIN = _args.skip_within
 SPLIT = _args.split
+INPUT_ALIGN = _args.input_align
+MIRROR_AUG = _args.mirror_aug
+PROTO_ALIGN = _args.proto_align
+CONV1_IDENTITY = _args.conv1_identity
+CHANNEL_WEIGHT_IDENTITY = _args.channel_weight_identity
+RAW_COV_STREAM = _args.raw_cov_stream
+N_CHARTS = _args.n_charts
+CHART_FREEZE = _args.chart_freeze
+if N_CHARTS > 0 and RAW_COV_STREAM:
+    raise SystemExit('[错误] --n_charts 与 --raw_cov_stream 互斥')
+if CHART_FREEZE and N_CHARTS <= 0:
+    raise SystemExit('[错误] --chart_freeze 需搭配 --n_charts>0')
+HEAD_ONLY = _args.head_only
+INIT_FROM_PATH = _args.init_from
+if MIRROR_AUG and PROTO_ALIGN:
+    raise SystemExit('[错误] --mirror_aug 与 --proto_align 互斥(单变量纪律)')
 MAX_SUBJECTS = _args.max_subjects
+SUBJECT_IDS = ([int(x) - 1 for x in _args.subjects.split(',') if x.strip()]
+               if _args.subjects.strip() else [])
+if SUBJECT_IDS and MAX_SUBJECTS > 0:
+    raise SystemExit('[错误] --subjects 与 --max_subjects 不能同时使用')
+if SUBJECT_IDS:
+    SUBJECT_IDS = sorted(set(SUBJECT_IDS))
 NORM_TYPE = _args.norm
 BN_RECALIB = _args.bn_recalib
 if FREEZE_BACKEND and not LOAD_BACKEND_PATH:
@@ -174,6 +259,16 @@ if DATASET_NAME == 'physionetmi':
 else:
     DATA_PATH = str(BASE.parent / 'saved_data' / 'preprocessed_data_bci2a_raw_ica.pkl')
     FS = 250
+if _args.data_path:
+    DATA_PATH = _args.data_path
+# --resample_hz: 降到原 fs 的 1/k（载入后整数抽取，pkl 不动）。窗长按秒不变，
+# 故 WIN/STEP 随之变小，M 仍为 5。默认 None = 保持原采样率。
+FS_BASE = FS
+if _args.resample_hz:
+    FS = float(_args.resample_hz)
+    ratio = FS_BASE / FS
+    if not (0 < FS <= FS_BASE) or abs(ratio - round(ratio)) > 1e-9:
+        raise SystemExit(f'[错误] --resample_hz 必须能整除 {FS_BASE}（如 125 / 62.5）')
 WIN_SAMPLES = int(round(1.5 * FS))    # 窗长 1.5s
 STEP_SAMPLES = int(round(0.75 * FS))  # 步长 0.75s（50% 重叠）
 if SPLIT == 'cross_session' and DATASET_NAME != 'bci2a':
@@ -185,14 +280,14 @@ print(f'[切分口径] --split {SPLIT}: ' + (
     if SPLIT == 'cross_session' else
     '全部公开 trial 按类别分层随机 70/15/15（主协议）'))
 N_CLASSES = 4
-D_ATTN_IN, D_ATTN_OUT = 8, 8
+D_ATTN_IN, D_ATTN_OUT = _args.d_attn_in, 8
 PAIR_SUBJECTS = [3, 9]
 
 ITERATIONS = _args.iterations
 LR = 5e-4
 GRAD_CLIP = 1.0
 LOCAL_RADIUS = 6      # 全连接注意力（实际 M=5 时覆盖全部窗口）；保留原注意力机制的完整交互
-DROP_PROB = 0.3       # dropout（验证过的折中值：0.5 偏重，0.3 平衡效果与正则）
+DROP_PROB = _args.dropout   # dropout（验证过的折中值：0.5 偏重，0.3 平衡效果与正则）
 TEST_EVERY = 5
 
 # 参数分组（用于参数演化）
@@ -253,14 +348,35 @@ def split_by_session(X, y, sess, valid_ratio=0.25, random_state=42, others=None)
 
 
 def load_data():
-    subject_data, _ = load_preprocessed_dataset(DATA_PATH)
+    subject_data, metadata = load_preprocessed_dataset(DATA_PATH,
+                                                       sample_ratio=SAMPLE_RATIO)
+    if INPUT_ALIGN == 'raw':
+        if not metadata:
+            raise SystemExit('[错误] --input_align raw 需要 subject_metadata.ea_matrix')
+        raw = []
+        for i, (X, y) in enumerate(subject_data):
+            P = np.asarray(metadata[i]['ea_matrix'], dtype=np.float64)
+            Xr = np.einsum('ij,njt->nit', np.linalg.inv(P),
+                           np.asarray(X, dtype=np.float64))
+            raw.append((Xr.astype(np.float32), y))
+        subject_data = raw
+        print('[input_align] raw: X <- P^{-1} X（逐被试逆 EA，同一切分）')
     if MAX_SUBJECTS > 0:
         subject_data = subject_data[:MAX_SUBJECTS]
+    if _args.resample_hz:
+        from scipy.signal import resample_poly
+        down = int(round(FS_BASE / FS))
+        subject_data = [(resample_poly(np.asarray(X, dtype=np.float32), 1, down,
+                                       axis=-1).astype(np.float32), y)
+                        for X, y in subject_data]
+        print(f'[重采样] {FS_BASE} -> {FS:g} Hz（1/{down} 抽取，Kaiser 抗混叠）')
     T = subject_data[0][0].shape[-1]
     M = (T - WIN_SAMPLES) // STEP_SAMPLES + 1
     splits = {}
     for sid in PAIR_SUBJECTS:
         if sid > len(subject_data):      # --max_subjects 截断后跳过不存在的被试
+            continue
+        if SUBJECT_IDS and (sid - 1) not in SUBJECT_IDS:
             continue
         X, y = subject_data[sid - 1]
         if SPLIT == 'cross_session':
@@ -290,6 +406,71 @@ def load_data():
         cross = split_train_valid_test(X_all, y_all, train_ratio=0.70,
                                        valid_ratio=0.15, random_state=42,
                                        others=[sub_all])
+    if SUBJECT_IDS:
+        if SPLIT != 'samepool':
+            raise SystemExit('[错误] --subjects 子集筛选目前只支持 --split samepool')
+        keep = set(SUBJECT_IDS)
+        tr = np.isin(cross[6], list(keep))
+        va = np.isin(cross[7], list(keep))
+        te = np.isin(cross[8], list(keep))
+        cross = [cross[0][tr], cross[1][tr], cross[2][va], cross[3][va],
+                 cross[4][te], cross[5][te], cross[6][tr], cross[7][va], cross[8][te]]
+    if PROTO_ALIGN:
+        if DATASET_NAME != 'bci2a' or SPLIT != 'samepool':
+            raise SystemExit('[错误] --proto_align 目前只支持 bci2a + samepool')
+
+        def trial_le(Xb):
+            """逐试次整段协方差的 log 嵌入 (n,484):K-means 与 LE 距离的公共底座。"""
+            Xc = np.asarray(Xb, dtype=np.float64)
+            Xc = Xc - Xc.mean(axis=-1, keepdims=True)
+            C = np.einsum('nct,ndt->ncd', Xc, Xc) / Xc.shape[-1]
+            w, V = np.linalg.eigh(C)
+            L = np.einsum('nij,nj,nkj->nik', V, np.log(np.maximum(w, 1e-12)), V)
+            return L.reshape(len(L), -1)
+
+        from sklearn.cluster import KMeans
+        Ltr = trial_le(cross[0])
+        km = KMeans(n_clusters=PROTO_ALIGN, n_init=10, random_state=0).fit(Ltr)
+        centers = km.cluster_centers_                       # (K,484) = LE 重心
+        u, U = np.linalg.eigh(centers.reshape(-1, 22, 22))  # 对称,可批量对角化
+        Wp = np.einsum('nij,nj,nkj->nik', U, 1.0 / np.sqrt(np.maximum(u, 1e-12)), U)
+        tr = np.einsum('nii->n', np.einsum('nij,nj,nkj->nik', U, u, U))
+        Wp = Wp * np.sqrt(np.maximum(tr, 1e-12) / 22.0)[:, None, None]  # 恢复整体尺度
+        print('[proto_align] K=%d, 训练折簇大小 %s' % (
+            PROTO_ALIGN, np.bincount(km.labels_).tolist()), flush=True)
+        ytr = np.asarray(cross[1])
+        for k in range(PROTO_ALIGN):
+            mk = km.labels_ == k
+            print('  簇%d: 逐类占比 %s' % (
+                k, np.round(np.bincount(ytr[mk], minlength=4) / max(mk.sum(), 1), 3).tolist()),
+                flush=True)
+
+        def route_whiten(Xb):
+            L = trial_le(Xb)
+            kk = np.argmin(((L[:, None, :] - centers[None]) ** 2).sum(-1), axis=1)
+            Xa = np.einsum('nij,njt->nit', Wp[kk], np.asarray(Xb, dtype=np.float64))
+            return Xa.astype(np.float32), kk
+
+        for pos in (0, 2, 4):                               # train/valid/test 的 X
+            cross[pos], _ = route_whiten(cross[pos])
+        print('[proto_align] train/valid/test 已按最近原型路由白化', flush=True)
+    if MIRROR_AUG:
+        if DATASET_NAME != 'bci2a' or SPLIT != 'samepool':
+            raise SystemExit('[错误] --mirror_aug 目前只支持 bci2a + samepool')
+        pairs = [('FC3', 'FC4'), ('FC1', 'FC2'), ('C5', 'C6'), ('C3', 'C4'),
+                 ('C1', 'C2'), ('CP3', 'CP4'), ('CP1', 'CP2'), ('P1', 'P2')]
+        ch = {n: i for i, n in enumerate(BCI2A_CHANNELS)}
+        perm = np.arange(len(BCI2A_CHANNELS))
+        for a, b in pairs:
+            perm[ch[a]], perm[ch[b]] = ch[b], ch[a]
+        fmap = np.array([1, 0, 2, 3])       # left<->right; feet/tongue 不变
+        n0 = len(cross[1])
+        cross = [np.concatenate([cross[0], np.asarray(cross[0])[:, perm]], 0),
+                 np.concatenate([cross[1], fmap[np.asarray(cross[1])]], 0),
+                 cross[2], cross[3], cross[4], cross[5],
+                 np.concatenate([cross[6], cross[6]], 0), cross[7], cross[8]]
+        print('[mirror_aug] 训练折加倍: %d -> %d 试次(左右通道互换+手类标签互换)'
+              % (n0, len(cross[1])), flush=True)
     print(f'[cross_mix 切分/{SPLIT}] train {len(cross[1])} / valid {len(cross[3])} / '
           f'test {len(cross[5])} 试次, 测试集覆盖 {len(np.unique(cross[8]))} 个被试'
           + (', 全部来自 session1' if SPLIT == 'cross_session' else ', 全部公开 trial 随机分层'))
@@ -320,8 +501,10 @@ def _match_param(key, name):
     """参数分组匹配。普通前缀 startswith；conv2 需跨多尺度分支聚合
     （conv2.weight/conv2.bias 会漏掉 conv2.convs.N.weight/bias → 改成通配 *）。"""
     if key in ('conv2.weight', 'conv2.bias'):
-        suffix = '.'.join(key.split('.')[1:])          # weight / bias
-        return (name == key) or (name.startswith('conv2.') and name.endswith('.' + suffix))
+        suffix = key.split('.')[-1]                    # weight / bias
+        # 可分离版的键是 conv2.dw_weight / pw_weight（不以 '.weight' 结尾），
+        # 故这里匹配后缀而不带前导点；全连接版 conv2.weight 仍命中 name == key。
+        return (name == key) or (name.startswith('conv2.') and name.endswith(suffix))
     return name.startswith(key)
 
 
@@ -802,6 +985,28 @@ def train_with_record(tag, net, tr_ld, va_ld, te_ld, M, ckpt_prefix,
     return rec
 
 
+def init_chart_refs(net, X_tr, seed):
+    """n_charts>0 时用训练折(仅训练折、无标签、无 subject_id)协方差初始化 chart_ref。
+
+    W_k = chol(C_k) ⇒ R_k = W_k W_kᵀ + 1e-4·I ≈ C_k,即参考点初始 = 训练折随机抽的
+    试次任务窗协方差(取窗/中心化/迹归一与模型 _chart_vecs 同构造)。抽样用本次
+    run seed 的独立 numpy rng —— 固定臂与可学习臂同 seed 得同一组参考点,配对可比。
+    可学习臂 requires_grad 保持 True,由 train_with_record 里
+    filter(requires_grad) 自动纳入现有 Adam(同 lr/wd,不另建组);固定臂冻结。"""
+    seg = np.asarray(X_tr, dtype=np.float64)[:, :, net.ract1.win:]
+    seg = seg - seg.mean(-1, keepdims=True)
+    C = np.einsum('nct,ndt->ncd', seg, seg) / seg.shape[-1]
+    C = C * (C.shape[1] / np.trace(C, axis1=1, axis2=2)[:, None, None])
+    idx = np.random.default_rng(seed).choice(len(C), net.n_charts, replace=False)
+    W = torch.linalg.cholesky(torch.from_numpy(C[idx].copy()))
+    with torch.no_grad():
+        net.chart_ref.copy_(W.to(net.chart_ref.device).to(net.chart_ref.dtype))
+    net.chart_ref.requires_grad_(not CHART_FREEZE)
+    print(f'[chart_ref] K={net.n_charts}, 训练折试次 {np.asarray(idx).tolist()} '
+          f'(seed={seed}), 臂={"固定(chart_freeze)" if CHART_FREEZE else "可学习"}',
+          flush=True)
+
+
 def main():
     print('=' * 70)
     print(f'训练过程全记录（{DATASET_NAME}）：S03/S09 被试内 + 全量混合跨被试')
@@ -809,13 +1014,24 @@ def main():
     subject_data, T, M, splits, cross_split = load_data()
     print(f'T={T}, n_windows M={M}, 混合被试数={len(subject_data)}')
 
-    results = {'config': {'subjects': PAIR_SUBJECTS, 'iterations': ITERATIONS,
+    results = {'config': {'subjects': PAIR_SUBJECTS, 'subject_ids': SUBJECT_IDS,
+                          'iterations': ITERATIONS,
                           'lr': LR, 'wd': WD, 'input_windows_before_conv2': M,
-                          'split': SPLIT}, 'models': {}}
+                          'split': SPLIT, 'input_align': INPUT_ALIGN,
+                          'mirror_aug': MIRROR_AUG, 'proto_align': PROTO_ALIGN,
+                          'conv1_identity': CONV1_IDENTITY,
+                          'channel_weight_identity': CHANNEL_WEIGHT_IDENTITY,
+                          'raw_cov_stream': RAW_COV_STREAM,
+                          'n_charts': N_CHARTS, 'chart_freeze': CHART_FREEZE,
+                          'fs': FS, 'win_samples': WIN_SAMPLES, 'step_samples': STEP_SAMPLES,
+                          'resample_hz': _args.resample_hz,
+                          'conv2_separable': _args.conv2_separable,
+                          'n_spatial_filters': N_SPATIAL_FILTERS},
+                          'models': {}}
 
     def _make_net():
         """统一经 build_matt_model 构建；模型只接收 EEG，不接收被试身份。"""
-        return build_matt_model(WIN_SAMPLES, STEP_SAMPLES, {
+        net = build_matt_model(WIN_SAMPLES, STEP_SAMPLES, {
             'n_classes': N_CLASSES,
             'd_attn_in': D_ATTN_IN,
             'd_attn_out': D_ATTN_OUT,
@@ -823,7 +1039,7 @@ def main():
             'anchor_stride': None,
             'n_heads': 1,
             'n_windows': None,
-            'conv2_separable': False,
+            'conv2_separable': _args.conv2_separable,
             'conv2_multiscale': CONV2_MULTISCALE,
             'conv2_ms_per_branch': CONV2_MS_PER_BRANCH,
             'conv2_ms_specs': CONV2_MS_SPECS,
@@ -835,13 +1051,31 @@ def main():
             'manifold_change': MANIFOLD_CHANGE,
             'dropout': DROP_PROB,
             'norm_type': NORM_TYPE,
+            'raw_cov_stream': RAW_COV_STREAM,
+            'n_charts': N_CHARTS,
         })
+        if CONV1_IDENTITY:
+            with torch.no_grad():
+                net.conv1.weight.zero_()
+                for k in range(net.conv1.weight.shape[0]):
+                    net.conv1.weight[k, 0, k, 0] = 1.0
+                net.conv1.bias.zero_()
+            net.conv1.weight.requires_grad_(False)
+            net.conv1.bias.requires_grad_(False)
+        if CHANNEL_WEIGHT_IDENTITY:
+            with torch.no_grad():
+                net.channel_weight.fixed_mask.fill_(1.0)
+                net.channel_weight.scale.fill_(1.0)
+            net.channel_weight.scale.requires_grad_(False)
+        return net
 
     # 被试内（--skip_within 时跳过，纯 cross_mix 诊断用）
     for sid in ([] if SKIP_WITHIN else PAIR_SUBJECTS):
         X_tr, y_tr, X_va, y_va, X_te, y_te = splits[sid]
         tr_ld, va_ld, te_ld = make_loaders(X_tr, y_tr, X_va, y_va, X_te, y_te)
         net = _make_net()
+        if N_CHARTS > 0:
+            init_chart_refs(net, X_tr, SEED)
         if LOAD_BACKEND_PATH:
             load_backend_state(net, LOAD_BACKEND_PATH, freeze=FREEZE_BACKEND)
         _prior = (net.channel_weight.scale.detach().clone() if
@@ -859,6 +1093,20 @@ def main():
     tr_ld, va_ld, te_ld = make_loaders(X_tr, y_tr, X_va, y_va, X_te, y_te,
                                        s_tr=s_tr, s_va=s_va, s_te=s_te)
     net = _make_net()
+    if N_CHARTS > 0:
+        init_chart_refs(net, X_tr, SEED)     # 仅训练折;构建后、训练前
+    if INIT_FROM_PATH:
+        net.load_state_dict(torch.load(INIT_FROM_PATH, map_location='cpu'))
+        print('[init_from] 已加载 %s' % INIT_FROM_PATH)
+    if HEAD_ONLY:
+        with torch.no_grad():   # LazyLinear 需先 forward 一次物化参数(输入须非退化)
+            _ = net(torch.randn(2, 1, 22, 1126,
+                                device=next(net.parameters()).device) * 1e-5)
+        for p in net.parameters():
+            p.requires_grad_(False)
+        for p in net.linear.parameters():
+            p.requires_grad_(True)
+        print('[head_only] 已冻结除 linear 外全部参数')
     if LOAD_BACKEND_PATH:
         load_backend_state(net, LOAD_BACKEND_PATH, freeze=FREEZE_BACKEND)
     _prior = (net.channel_weight.scale.detach().clone() if

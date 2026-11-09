@@ -1,0 +1,314 @@
+# -*- coding: utf-8 -*-
+"""
+MOABB PhysionetMI 四类运动想象 (MI) 数据加载模块。
+
+只处理运动想象任务，不处理运动执行 (ME)：
+  1) 排除 6 名异常被试 (S088, S089, S092, S100, S104, S106)
+  2) 丢弃 Run 1/2 基线，只使用 MI run：4, 6, 8, 10, 12, 14
+  3) 将 T0/T1/T2 映射为四类 MI 事件：left_hand / right_hand / hands / feet
+  4) 返回 [-1.0, 3.5]s epoch
+
+同时提供与 csv_loader.py 兼容的接口：load_subject_mi_trials。
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+from typing import Tuple
+
+import mne
+import numpy as np
+from moabb.datasets import PhysionetMI
+
+from preprocessing import preprocess_physionetmi_raw, _normalize_ch_name, epochs_to_arrays
+
+SFREQ = 160.0
+
+# MNE eegbci 数据目录配置键
+_EEGBCI_PATH_KEY = "MNE_DATASETS_EEGBCI_PATH"
+
+# 2026-10-24 适配实验: PHYSIONET_ALL_EEG=1 时保留全部 64 个 EEG 通道(Fp1/Fp2 仍转
+# eog 作 ICA 参考、ICA 后剔除 ⇒ 输出 62 通道); 默认 0 = 冻结行为(22 通道)。
+_ALL_EEG_NAMES = None   # all 模式下首个被试加载时填(EDF 通道名跨被试一致)
+
+ALL_EEG_MODE = os.environ.get("PHYSIONET_ALL_EEG", "0") == "1"
+
+
+def output_channel_names():
+    return list(_ALL_EEG_NAMES) if (ALL_EEG_MODE and _ALL_EEG_NAMES) \
+        else list(SELECTED_CHANNEL_NAMES)
+
+
+def output_n_channels():
+    return len(output_channel_names())
+
+
+def _find_existing_eegbci_root() -> Path | None:
+    r"""
+    自动寻找已下载的 eegbci 数据根目录。
+    用户可能通过 download_physionet.py 把数据下到了 MNE 默认目录，
+    也可能因为配置损坏下到了项目目录下的异常路径（如 C-\Users\...）。
+    """
+    project_dir = Path(__file__).resolve().parent
+    candidates: list[Path] = []
+
+    # 1) MNE 当前配置的路径
+    configured = mne.get_config(_EEGBCI_PATH_KEY)
+    if configured:
+        candidates.append(Path(configured))
+
+    # 2) 项目目录下常见的异常/损坏路径（用当前用户名替代硬编码）
+    _current_user = Path.home().name
+    candidates.append(project_dir / "C-\\Users" / _current_user / "mne_data")
+    candidates.append(project_dir / "C:\\Users" / _current_user / "mne_data")
+
+    # 3) 系统默认路径
+    candidates.append(Path.home() / "mne_data")
+
+    # 去重并保持顺序
+    seen = set()
+    unique_candidates = []
+    for c in candidates:
+        norm = str(c.resolve()) if c.exists() else str(c)
+        if norm not in seen:
+            seen.add(norm)
+            unique_candidates.append(c)
+
+    # 用 S001R04.edf 作为存在性探针
+    probe = Path("MNE-eegbci-data") / "files" / "eegmmidb" / "1.0.0" / "S001" / "S001R04.edf"
+    for root in unique_candidates:
+        if (root / probe).exists():
+            return root
+
+    return None
+
+
+# 模块导入时自动定位已下载数据；如果找不到则使用 MNE 默认目录
+_EEGBCI_DATA_PATH = _find_existing_eegbci_root()
+if _EEGBCI_DATA_PATH is None:
+    _EEGBCI_DATA_PATH = Path(mne.get_config(_EEGBCI_PATH_KEY) or Path.home() / "mne_data")
+print(f"📁 使用已下载数据目录: {_EEGBCI_DATA_PATH}")
+
+# 排除的异常被试（原始 MOABB ID，对应论文 Table 4）
+EXCLUDED_SUBJECTS = {88, 89, 92, 100, 104, 106}
+
+# 有效被试列表（103 人，保留原始编号）
+VALID_SUBJECTS = sorted(set(range(1, 110)) - EXCLUDED_SUBJECTS)
+
+# MI run 原始编号：只保留四类运动想象任务 run
+MI_RUNS = {4, 6, 8, 10, 12, 14}
+
+# MI run 中 T1/T2 对应的四类事件名
+# Run 4,8,12 为单侧想象（左/右拳）；Run 6,10,14 为双侧想象（双拳/双脚）
+MI_EVENT_NAMES = {
+    ("fist", "T1"): "left_hand",
+    ("fist", "T2"): "right_hand",
+    ("both", "T1"): "hands",
+    ("both", "T2"): "feet",
+}
+
+# 与 csv_loader.py / preprocessing.py 一致的 22 通道选择
+SELECTED_CHANNEL_NAMES = [
+    "Fz", "FC3", "FC1", "FCz", "FC2", "FC4",
+    "C5", "C3", "C1", "Cz", "C2", "C4", "C6",
+    "CP3", "CP1", "CPz", "CP2", "CP4",
+    "P1", "Pz", "P2", "POz",
+]
+
+
+def _extract_run_number(path: str | Path) -> int:
+    """从 EDF 文件名（如 S001R03.edf）中提取 run 编号。"""
+    stem = Path(path).stem
+    match = re.search(r"R(\d{2})$", stem)
+    if not match:
+        raise ValueError(f"无法从文件名 {stem} 解析 run 编号")
+    return int(match.group(1))
+
+
+def _validate_subject(subject: int) -> int:
+    """检查并返回有效被试编号。"""
+    if subject in EXCLUDED_SUBJECTS:
+        raise ValueError(f"被试 S{subject:03d} 在排除列表 {EXCLUDED_SUBJECTS} 中")
+    if not 1 <= subject <= 109:
+        raise ValueError(f"被试编号 {subject} 超出范围 1~109")
+    return subject
+
+
+def _build_mi_edf_paths(subject: int, root: Path) -> list[Path]:
+    """直接从给定根目录构建该被试的 MI run EDF 路径。"""
+    base = root / "MNE-eegbci-data" / "files" / "eegmmidb" / "1.0.0" / f"S{subject:03d}"
+    paths = [base / f"S{subject:03d}R{run:02d}.edf" for run in sorted(MI_RUNS)]
+    return paths
+
+
+def get_subject_edf_paths(subject: int, verbose: bool = False) -> list[Path]:
+    r"""
+    返回单个被试全部 MI run 的原始 EDF 文件路径，按 run 编号排序。
+    优先从已发现的数据目录直接构建路径，避免 MNE 对异常路径的解析错误；
+    如有缺失，再回退到 MOABB 的 data_path 触发下载（下载目录为默认 C:\Users\<user>\mne_data）。
+    """
+    _validate_subject(subject)
+
+    # 1) 直接从已发现的数据根目录构建路径
+    paths = _build_mi_edf_paths(subject, _EEGBCI_DATA_PATH)
+    all_exist = all(p.exists() for p in paths)
+
+    if not all_exist:
+        # 2) 有缺失时回退到 MOABB data_path，并强制使用默认目录以下载缺失文件
+        default_path = Path.home() / "mne_data"
+        print(f"⚠️ 部分 MI run 在 {_EEGBCI_DATA_PATH} 不存在，回退到默认下载目录: {default_path}")
+        mne.set_config(_EEGBCI_PATH_KEY, str(default_path))
+        dataset = PhysionetMI(imagined=True, executed=False)
+        paths = [Path(p) for p in dataset.data_path(subject)]
+        paths = [p for p in paths if _extract_run_number(p) in MI_RUNS]
+        paths.sort(key=lambda p: _extract_run_number(p))
+
+    if verbose:
+        print(f"  数据根目录: {_EEGBCI_DATA_PATH}")
+        for p in paths:
+            print(f"    {'✅' if p.exists() else '❌'} {p.name} (存在={p.exists()})")
+
+    return paths
+
+
+def _load_run_raw(path: Path) -> mne.io.BaseRaw:
+    """读取单个 run 的 EDF 文件：读入后立即降维到 22 个目标中央区通道。
+
+    直接在单个 run 上 pick 22 通道（而不是 6 个 run 全量 64 通道拼接后再选），
+    读盘后的内存占用与后续滤波/ICA 计算量都按 22/64 比例大幅下降。
+    """
+    raw = mne.io.read_raw_edf(path, preload=True, verbose=False)
+    # 仅保留 EEG 通道（MNE 会自动提取 annotation，第 65 列不会被保留为数据通道）
+    raw.pick_types(eeg=True)
+    try:
+        raw.set_montage("standard_1020", match_case=False, on_missing="warn")
+    except Exception as e:
+        print(f'warning: 无法设置 montage: {e}')
+    # 立即降维：默认只保留 SELECTED_CHANNEL_NAMES 对应的 22 通道（兼容带后缀的 EDF 命名）；
+    # ALL_EEG 模式保留全部 EEG（Fp1/Fp2 从 keep 中排除、走下方 eog 参考路径）
+    global _ALL_EEG_NAMES
+    norm = {_normalize_ch_name(c): c for c in raw.ch_names}
+    keep_eog = [norm[ni] for ni in map(_normalize_ch_name, ('Fp1', 'Fp2')) if ni in norm]
+    if ALL_EEG_MODE:
+        keep = [c for c in raw.ch_names if c not in keep_eog]
+        _ALL_EEG_NAMES = list(keep)
+    else:
+        keep = [norm[n] for n in map(_normalize_ch_name, SELECTED_CHANNEL_NAMES) if n in norm]
+    # 对照 BCI:BCI 原生有真实 EOG1/2/3 通道,loader 保留后供 ica.find_bads_eog
+    # 做眼电子伪迹参考(对齐官方 EOG 回归清洗);Physionet eegmmidb 只有 64 个纯
+    # EEG 通道无 EOG,但最接近眼电的前额通道 Fp1/Fp2 同样可作参考,这里一并保留并
+    # 标记为 eog 类型,让 ICA 能按"眼电参考"检测伪迹,替代统计峰度降级兜底方案。
+    # ICA 完成后 eog 会被 drop,最终 pkl 仍只含 EEG 通道(22 或 all 模式 62)。
+    if ALL_EEG_MODE or len(keep) == len(SELECTED_CHANNEL_NAMES):
+        raw.pick_channels(keep + keep_eog)
+        if keep_eog:
+            raw.set_channel_types({ch: 'eog' for ch in keep_eog})
+    return raw
+
+
+def _map_run_annotations(raw: mne.io.BaseRaw, run_number: int) -> mne.io.BaseRaw:
+    """
+    将单个 MI run 的 T0/T1/T2 标注重命名为：
+      - T0 → rest
+      - T1/T2 → left_hand / right_hand / hands / feet（根据 run 类型）
+    """
+    # run 4,8,12 为单侧想象；run 6,10,14 为双侧想象
+    task_category = "fist" if run_number in {4, 8, 12} else "both"
+    old = raw.annotations
+    onsets, durations, descriptions = [], [], []
+
+    for onset, duration, desc in zip(old.onset, old.duration, old.description):
+        desc = str(desc).strip()
+        if desc == "T0":
+            descriptions.append("rest")
+        elif desc in ("T1", "T2"):
+            descriptions.append(MI_EVENT_NAMES[(task_category, desc)])
+        else:
+            descriptions.append(desc)
+
+        onsets.append(onset)
+        durations.append(duration)
+
+    raw.set_annotations(mne.Annotations(onsets, durations, descriptions))
+    return raw
+
+
+def load_subject_mi_raw(subject: int) -> mne.io.BaseRaw:
+    """
+    加载单个被试的全部 MI 任务 run（原始 4,6,8,10,12,14），
+    将标注统一重命名为 left_hand / right_hand / feet / hands，
+    拼接为一条连续 Raw 返回。
+
+    参数:
+        subject: 原始被试编号（1~109，排除异常被试）
+
+    返回:
+        拼接后的 MNE Raw 对象，仅包含四类 MI 事件标注。
+    """
+    _validate_subject(subject)
+    paths = get_subject_edf_paths(subject)
+    if not paths:
+        raise ValueError(f"被试 S{subject:03d} 没有有效的 MI run")
+
+    raws = []
+    for path in paths:
+        run_number = _extract_run_number(path)
+        raw_run = _load_run_raw(path)
+        raw_run = _map_run_annotations(raw_run, run_number)
+        raws.append(raw_run)
+
+    raw_all = raws[0] if len(raws) == 1 else mne.concatenate_raws(raws, preload=True)
+    return raw_all
+
+
+def load_subject_mi_trials(subject_id: int, reject_amp_uv: float = None) -> Tuple[np.ndarray, ...]:
+    """
+    与 csv_loader.py 接口兼容：加载单个被试的四类 MI 试次。
+
+    参数:
+        subject_id: 被试编号（1~109，排除列表除外）
+        reject_amp_uv: 峰峰值幅度阈值（µV），剔除超幅坏 trial；None=不剔除
+
+    返回:
+        left, right, feet, hands: 各为 np.ndarray [n_trials, 22, n_times]
+        若某类别无试次，返回形状 (0, 22, n_times) 的空数组
+    """
+    raw = load_subject_mi_raw(subject_id)
+    left_epochs, right_epochs, feet_epochs, hands_epochs = preprocess_physionetmi_raw(
+        raw, reject_amp_uv=reject_amp_uv)
+
+    epochs_map = {
+        "left_hand": left_epochs,
+        "right_hand": right_epochs,
+        "feet": feet_epochs,
+        "hands": hands_epochs,
+    }
+
+    return epochs_to_arrays(
+        epochs_map,
+        ["left_hand", "right_hand", "feet", "hands"],
+        output_n_channels(),
+    )
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("MOABB PhysionetMI 原始数据加载测试")
+    print("=" * 60)
+
+    test_subject = 1
+    print(f"\n测试加载被试 S{test_subject:03d} 的 MI 数据...")
+    raw = load_subject_mi_raw(test_subject)
+    print(f"  采样率: {raw.info['sfreq']:.0f} Hz")
+    print(f"  通道数: {len(raw.ch_names)}")
+    print(f"  时长: {raw.n_times / raw.info['sfreq']:.1f} s")
+    print(f"  事件: {set(raw.annotations.description)}")
+
+    left, right, feet, hands = load_subject_mi_trials(test_subject)
+    print(f"\n四类 MI epoch 形状:")
+    print(f"  左手: {left.shape}")
+    print(f"  右手: {right.shape}")
+    print(f"  双脚: {feet.shape}")
+    print(f"  双手: {hands.shape}")

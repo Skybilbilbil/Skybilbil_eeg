@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """训练预算标定:在"几分钟跑完"的约束下,bs / iters / lr 该怎么配。
 
+⚠ 口径(2026-10-30): 本脚本窗参数硬编码 375/187(250 Hz) + 全连接 conv2,是旧口径;
+   train_pair 的新默认为 62.5 Hz + 深度可分离,故本脚本的耗时/精度曲线不与新默认可比。
+
 固定条件:BCI-2a 留出被试 S08(训练 8 人 2764 / 验证 922 / 测试 576),
 seed42、IN、wd0.02、cosine、grad_clip 1.0,只扫 (BS, ITERS, LR)。
 基线 = bs64 / 150it / lr5e-4,GPU 上测试准确率 59.2%、单模型约 5 min。
@@ -23,7 +26,7 @@ import torch.nn as nn
 
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
-from utils.GetPhysionetMI import load_preprocessed_dataset, split_train_valid_test
+from utils.dataset import load_preprocessed_dataset, split_train_valid_test
 from utils.functions import build_matt_model
 
 DATA = BASE.parent / 'saved_data' / 'preprocessed_data_bci2a_raw_ica.pkl'
